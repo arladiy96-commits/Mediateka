@@ -24,8 +24,12 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # Google no longer publishes the legacy SDK "tools" package.
+      # Set up Android v4 explicitly without that removed package.
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
 
       - name: Install Android SDK 35
         shell: bash
