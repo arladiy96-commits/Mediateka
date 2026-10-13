@@ -1,0 +1,240 @@
+name: Bootstrap Android
+
+# Only the Run workflow button starts this workflow.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: serialtransfer-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Create Android project and commit it
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Never overwrite an Android project that already exists.
+          if [[ -e app/build.gradle || -e settings.gradle || -e gradlew ]]; then
+            echo "::error::Android project already exists. Bootstrap is a one-time action; use Build APK for later updates."
+            exit 1
+          fi
+
+          mkdir -p app/src/main/java/com/serialtransfer/app
+          mkdir -p app/src/main/res/values
+
+          cat > settings.gradle <<'FILE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'SerialTransfer'
+          include ':app'
+          FILE
+
+          cat > build.gradle <<'FILE'
+          plugins {
+              id 'com.android.application' version '8.6.1' apply false
+          }
+          FILE
+
+          cat > gradle.properties <<'FILE'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          org.gradle.daemon=false
+          android.useAndroidX=true
+          FILE
+
+          cat > app/build.gradle <<'FILE'
+          plugins {
+              id 'com.android.application'
+          }
+
+          def keystoreFile = System.getenv('ANDROID_KEYSTORE_FILE')
+          def keystorePassword = System.getenv('ANDROID_KEYSTORE_PASSWORD')
+          def keyAliasName = System.getenv('ANDROID_KEY_ALIAS')
+          def keyPasswordValue = System.getenv('ANDROID_KEY_PASSWORD')
+          def canSignRelease = keystoreFile && keystorePassword && keyAliasName && keyPasswordValue
+
+          android {
+              namespace 'com.serialtransfer.app'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.serialtransfer.app'
+                  minSdk 24
+                  targetSdk 35
+                  versionCode (findProperty('buildNumber') ?: '1').toInteger()
+                  versionName "0.1.${versionCode}"
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+
+              signingConfigs {
+                  if (canSignRelease) {
+                      release {
+                          storeFile file(keystoreFile)
+                          storePassword keystorePassword
+                          keyAlias keyAliasName
+                          keyPassword keyPasswordValue
+                      }
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      if (canSignRelease) {
+                          signingConfig signingConfigs.release
+                      }
+                  }
+              }
+          }
+          FILE
+
+          cat > app/src/main/AndroidManifest.xml <<'FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          FILE
+
+          cat > app/src/main/res/values/strings.xml <<'FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">SerialTransfer</string>
+          </resources>
+          FILE
+
+          cat > app/src/main/java/com/serialtransfer/app/MainActivity.java <<'FILE'
+          package com.serialtransfer.app;
+
+          import android.app.Activity;
+          import android.graphics.Color;
+          import android.os.Bundle;
+          import android.view.Gravity;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+
+          public class MainActivity extends Activity {
+              private int dp(int value) {
+                  return Math.round(getResources().getDisplayMetrics().density * value);
+              }
+
+              private TextView text(String value, int sizeSp, int color) {
+                  TextView view = new TextView(this);
+                  view.setText(value);
+                  view.setTextSize(sizeSp);
+                  view.setTextColor(color);
+                  return view;
+              }
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  getWindow().setStatusBarColor(Color.rgb(15, 21, 28));
+                  getWindow().setNavigationBarColor(Color.rgb(15, 21, 28));
+
+                  LinearLayout layout = new LinearLayout(this);
+                  layout.setOrientation(LinearLayout.VERTICAL);
+                  layout.setGravity(Gravity.CENTER_VERTICAL);
+                  layout.setPadding(dp(24), dp(24), dp(24), dp(24));
+                  layout.setBackgroundColor(Color.rgb(15, 21, 28));
+
+                  TextView title = text("SerialTransfer", 28, Color.WHITE);
+                  layout.addView(title);
+
+                  TextView subtitle = text("Передача сериалов по Wi-Fi", 16, Color.rgb(180, 194, 207));
+                  LinearLayout.LayoutParams subtitleParams = new LinearLayout.LayoutParams(-1, -2);
+                  subtitleParams.topMargin = dp(10);
+                  layout.addView(subtitle, subtitleParams);
+
+                  TextView status = text(
+                          "Первый запуск: Android-проект создан.\n\n"
+                          + "Совместимость: Android 7 и новее.\n"
+                          + "Режимы отправителя, получателя и запись на microSD "
+                          + "будут добавлены в следующих обновлениях.",
+                          15, Color.rgb(215, 222, 231));
+                  LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(-1, -2);
+                  statusParams.topMargin = dp(30);
+                  layout.addView(status, statusParams);
+
+                  setContentView(layout);
+              }
+          }
+          FILE
+
+          # The Android .gitignore selected when the repository was created is preserved.
+          cat >> .gitignore <<'FILE'
+
+          # SerialTransfer generated files and signing material
+          .gradle/
+          **/build/
+          local.properties
+          *.jks
+          *.keystore
+          FILE
+
+          echo "Generating the checked-in Gradle Wrapper (Gradle 8.7)..."
+          gradle wrapper --gradle-version 8.7 --distribution-type bin
+          chmod +x gradlew
+
+          # The bootstrap workflow itself remains untouched; only project files are added.
+          git add settings.gradle build.gradle gradle.properties app/ gradle/ gradlew gradlew.bat .gitignore
+          if git diff --cached --quiet; then
+            echo "No new project files to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Bootstrap native Android SerialTransfer project"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          echo "Android project created on branch ${GITHUB_REF_NAME}."

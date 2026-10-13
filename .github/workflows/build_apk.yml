@@ -1,0 +1,126 @@
+name: Build APK
+
+# Manual only: no push, pull_request or release triggers.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: serialtransfer-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        shell: bash
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+
+      - name: Configure Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Select signing mode
+        id: signing
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/serialtransfer-release.jks
+        run: |
+          set -euo pipefail
+
+          if [[ ! -x ./gradlew ]]; then
+            echo "::error::Gradle Wrapper missing. Run Bootstrap Android first."
+            exit 1
+          fi
+
+          # Four repository secrets are required for a long-lived release signature.
+          secret_count=0
+          for value in "$ANDROID_KEYSTORE_BASE64" "$ANDROID_KEYSTORE_PASSWORD" "$ANDROID_KEY_ALIAS" "$ANDROID_KEY_PASSWORD"; do
+            if [[ -n "$value" ]]; then
+              secret_count=$((secret_count + 1))
+            fi
+          done
+
+          if [[ "$secret_count" -ne 0 && "$secret_count" -ne 4 ]]; then
+            echo "::error::Configure all four ANDROID_KEYSTORE_* / ANDROID_KEY_* secrets, or none of them."
+            exit 1
+          fi
+
+          if [[ "$secret_count" -eq 4 ]]; then
+            umask 077
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_KEYSTORE_FILE"
+            echo 'mode=release' >> "$GITHUB_OUTPUT"
+            echo 'Using the persistent release signing key from GitHub Secrets.'
+          else
+            echo 'mode=debug' >> "$GITHUB_OUTPUT"
+            echo '::warning::Signing secrets are absent. Publishing an installable DEBUG APK. Keys generated on different runners may differ: to preserve app data across updates, configure permanent release signing before regular use.'
+          fi
+      - name: Build installable APK
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/serialtransfer-release.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ '${{ steps.signing.outputs.mode }}' == 'release' ]]; then
+            ./gradlew --no-daemon --stacktrace assembleRelease -PbuildNumber=${{ github.run_number }}
+          else
+            ./gradlew --no-daemon --stacktrace assembleDebug -PbuildNumber=${{ github.run_number }}
+          fi
+
+      - name: Publish APK directly to GitHub Releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          MODE='${{ steps.signing.outputs.mode }}'
+          TAG="v0.1.${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p dist
+
+          if [[ "$MODE" == "release" ]]; then
+            SOURCE_APK='app/build/outputs/apk/release/app-release.apk'
+            RELEASE_NOTES='Android APK signed with the repository release key. Installable on Android 7+.'
+            EXTRA=()
+          else
+            SOURCE_APK='app/build/outputs/apk/debug/app-debug.apk'
+            RELEASE_NOTES='Test build (debug-signed). Installable on Android 7+. For in-place updates without data loss, configure a permanent release signing key.'
+            EXTRA=(--prerelease)
+          fi
+
+          [[ -s "$SOURCE_APK" ]] || { echo "::error::APK missing: $SOURCE_APK"; exit 1; }
+          cp "$SOURCE_APK" dist/SerialTransfer.apk
+          sha256sum dist/SerialTransfer.apk
+
+          gh release create "$TAG" dist/SerialTransfer.apk \
+            --target "$GITHUB_SHA" \
+            --title "SerialTransfer $TAG" \
+            --notes "$RELEASE_NOTES" \
+            "${EXTRA[@]}"
+
+          {
+            echo "### APK published to GitHub Releases"
+            echo "- Tag: $TAG"
+            echo "- Signing mode: $MODE"
+            echo "- APK asset: SerialTransfer.apk"
+            echo "- Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          } >> "$GITHUB_STEP_SUMMARY"
