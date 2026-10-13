@@ -77,7 +77,16 @@ public final class TransferService extends Service {
                     if (server != null) { server.stop(); server = null; }
                     serverRunning = false;
                     List<MediaLibrary.Film> entries = MediaLibrary.scan(TransferService.this);
-                    String code = String.format(Locale.US, "%08d", new SecureRandom().nextInt(100000000));
+                    // A saved pairing code is essential: the tablet must not be
+                    // forced to pair again every time the phone restarts.
+                    android.content.SharedPreferences pairing = MediaLibrary.prefs(TransferService.this);
+                    String code = pairing.getString("stable_access_code", "");
+                    if (code == null || !code.matches("[0-9]{8}")) {
+                        code = String.format(Locale.US, "%08d", new SecureRandom().nextInt(100000000));
+                        if (!pairing.edit().putString("stable_access_code", code).commit()) {
+                            throw new IllegalStateException("Не удалось сохранить код подключения");
+                        }
+                    }
                     HttpFileServer next = new HttpFileServer(TransferService.this, entries, code);
                     next.start();
                     server = next;
