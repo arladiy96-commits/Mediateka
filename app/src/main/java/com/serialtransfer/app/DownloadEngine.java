@@ -118,7 +118,8 @@ final class DownloadEngine {
                     channel.truncate(0);
                     position = 0;
                 }
-                if (total > 0 && position == total) {
+                if (total >= 0 && position == total) {
+                    DownloadQueue.completed(context, item);
                     progress.onProgress("Уже скачано: " + label, total, total);
                     return;
                 }
@@ -160,6 +161,7 @@ final class DownloadEngine {
                     if (total >= 0 && downloaded != total)
                         throw new Exception("Передача оборвалась: " + MediaLibrary.readableSize(downloaded)
                                 + " из " + MediaLibrary.readableSize(total) + ". Повтори скачивание для продолжения.");
+                    DownloadQueue.completed(context, item);
                     progress.onProgress("Готово: " + label, downloaded, total);
                 } finally {
                     connection.disconnect();
@@ -176,22 +178,17 @@ final class DownloadEngine {
     }
 
     private Uri getOrCreate(String id, String name) throws Exception {
-        SharedPreferences p = MediaLibrary.prefs(context);
-        String prefKey = "download_" + validatedHost(host).replace('.', '_') + "_" + id;
-        String previous = p.getString(prefKey, "");
-        if (!previous.isEmpty()) {
-            Uri uri = Uri.parse(previous);
-            try (ParcelFileDescriptor fd = resolver.openFileDescriptor(uri, "rw")) {
-                if (fd != null) return uri;
+        Uri previous = DownloadQueue.knownFile(context, id, tree, host, host);
+        if (previous != null) {
+            try (ParcelFileDescriptor fd = resolver.openFileDescriptor(previous, "rw")) {
+                if (fd != null) return previous;
             } catch (Exception ignored) { }
         }
         String docId = DocumentsContract.getTreeDocumentId(tree);
         Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, docId);
         Uri created = DocumentsContract.createDocument(resolver, parent, MediaLibrary.mime(name), name);
-        if (created == null) throw new Exception("Не удалось создать файл на microSD");
-        // commit(), not apply(): remember its URI before any network bytes arrive.
-        if (!p.edit().putString(prefKey, created.toString()).commit())
-            throw new Exception("Не удалось сохранить путь загруженного файла");
+        if (created == null) throw new Exception("Не удалось создать серию на microSD");
+        DownloadQueue.rememberFile(context, id, created, tree);
         return created;
     }
 

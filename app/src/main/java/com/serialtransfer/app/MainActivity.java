@@ -63,6 +63,9 @@ public final class MainActivity extends Activity {
     private int mode;
     private boolean connecting;
     private boolean disposed;
+    private boolean linkConnected;
+    private int seenQueueRevision;
+    private long nextReconnectAt;
     private String statusMessage = "Готово к подключению";
     private final Handler handler = new Handler(Looper.getMainLooper());
 
@@ -90,6 +93,19 @@ public final class MainActivity extends Activity {
                 }
                 transferStatus.setText(description);
             }
+            if (mode == 1 && seenQueueRevision != TransferService.queueRevision) {
+                seenQueueRevision = TransferService.queueRevision;
+                render();
+            }
+            // When the app stays open, try reconnecting after Wi-Fi returns.
+            // A manual pause deliberately disables automatic resuming.
+            long now = android.os.SystemClock.elapsedRealtime();
+            if (mode == 1 && now >= nextReconnectAt && !connecting
+                    && !TransferService.downloading && !DownloadQueue.paused(MainActivity.this)
+                    && DownloadQueue.waiting(MainActivity.this) > 0) {
+                nextReconnectAt = now + 45000;
+                connectSaved(true);
+            }
             handler.postDelayed(this, 900);
         }
     };
@@ -100,6 +116,8 @@ public final class MainActivity extends Activity {
         getWindow().setNavigationBarColor(BG);
         SharedPreferences prefs = MediaLibrary.prefs(this);
         mode = prefs.getInt("screen", 0);
+        try { remoteFiles = new JSONArray(prefs.getString("remote_cache", "[]")); }
+        catch (Exception ignored) { remoteFiles = new JSONArray(); }
         render();
         handler.post(ticker);
         if (mode == 0) startSenderIfRemembered();
@@ -119,6 +137,7 @@ public final class MainActivity extends Activity {
     }
 
     private void render() {
+        seenQueueRevision = TransferService.queueRevision;
         hostInfo = null;
         linkStatus = null;
         transferStatus = null;
@@ -170,6 +189,7 @@ public final class MainActivity extends Activity {
     private void chooseMode(int next) {
         if (mode == next) return;
         mode = next;
+        linkConnected = false;
         MediaLibrary.prefs(this).edit().putInt("screen", mode).apply();
         render();
         if (mode == 0) startSenderIfRemembered();
@@ -312,10 +332,34 @@ public final class MainActivity extends Activity {
                     }
                 });
 
+        int waiting = DownloadQueue.waiting(this);
+        if (waiting > 0) {
+            LinearLayout queuePanel = panel();
+            queuePanel.addView(text("Очередь сохранена · " + waiting + " серий", 15, ACCENT, true));
+            queuePanel.addView(text(DownloadQueue.paused(this)
+                    ? "На паузе. Нажми «Скачать недостающие», чтобы продолжить."
+                    : "После подключения к POCO очередь продолжится автоматически.",
+                    12, MUTED, false), spaced(5, 0));
+            content.addView(queuePanel, spaced(8, 8));
+        }
         sectionTitle("Доступные серии", remoteFiles.length() == 0 ?
                 "После подключения здесь появится библиотека телефона." :
-                "Выбери нужные серии. Они скачаются по очереди.");
+                "Уже скачанное отмечается автоматически. Можно выбрать оставшиеся серии.");
         if (remoteFiles.length() > 0) {
+            int finished = 0;
+            int missing = 0;
+            for (int i = 0; i < remoteFiles.length(); i++) {
+                JSONObject item = remoteFiles.optJSONObject(i);
+                if (item == null) continue;
+                if (DownloadQueue.DONE.equals(DownloadQueue.status(this, item.optString("id")))) finished++;
+                else missing++;
+            }
+            note("На microSD: " + finished + " · Ещё не скачано: " + missing);
+            if (missing > 0) {
+                action("Скачать недостающие · " + missing, true, new View.OnClickListener() {
+                    @Override public void onClick(View v) { downloadAllMissing(); }
+                });
+            }
             LinearLayout selection = row();
             TextView summary = text(remoteFiles.length() + " файлов", 14, MUTED, false);
             selection.addView(summary, new LinearLayout.LayoutParams(0, -2, 1));
@@ -326,6 +370,7 @@ public final class MainActivity extends Activity {
                 @Override public void onClick(View v) { setAll(false); }
             });
             content.addView(selection, spaced(0, 10));
+            final Set<String> queuedIds = DownloadQueue.queuedIds(this);
             LinearLayout listing = panel();
             listing.setPadding(dp(7), dp(5), dp(7), dp(5));
             for (int i = 0; i < remoteFiles.length(); i++) {
@@ -334,13 +379,23 @@ public final class MainActivity extends Activity {
                 final String id = episode.optString("id");
                 CheckBox check = new CheckBox(this);
                 check.setTag(id);
+                String state = DownloadQueue.status(this, id);
+                boolean queued = queuedIds.contains(id);
+                if (DownloadQueue.DONE.equals(state)) chosen.remove(id);
+                String stateLabel = DownloadQueue.DONE.equals(state) ? "✓ Скачано на microSD"
+                        : queued ? "◷ В очереди"
+                        : DownloadQueue.PARTIAL.equals(state) ? "↻ Можно продолжить"
+                        : "Не скачано";
                 check.setText(episode.optString("name", "Серия") + "\n"
-                        + MediaLibrary.readableSize(episode.optLong("size", -1)));
+                        + MediaLibrary.readableSize(episode.optLong("size", -1))
+                        + " · " + stateLabel);
                 check.setTextSize(13);
                 check.setTextColor(WHITE);
                 check.setPadding(dp(7), dp(7), dp(4), dp(7));
                 check.setButtonTintList(ColorStateList.valueOf(ACCENT));
                 check.setChecked(chosen.contains(id));
+                check.setEnabled(!DownloadQueue.DONE.equals(state) && !queued);
+                if (!check.isEnabled()) check.setTextColor(MUTED);
                 check.setOnCheckedChangeListener((b, selected) -> {
                     if (selected) chosen.add(id); else chosen.remove(id);
                     updateDownloadButton();
@@ -392,8 +447,8 @@ public final class MainActivity extends Activity {
     private void updateDownloadButton() {
         if (downloadButton == null) return;
         int selected = chosen.size();
-        downloadButton.setText(selected == 0 ? "Выбери серии для скачивания" :
-                "Скачать на microSD · " + selected);
+        downloadButton.setText(selected == 0 ? "Выбери серии" :
+                "Добавить в загрузки · " + selected);
         downloadButton.setEnabled(selected > 0);
         downloadButton.setAlpha(selected > 0 ? 1f : .55f);
     }
@@ -401,6 +456,7 @@ public final class MainActivity extends Activity {
     private void setAll(boolean selected) {
         chosen.clear();
         for (CheckBox check : episodeChecks) {
+            if (!check.isEnabled()) continue;
             check.setChecked(selected);
             if (selected) chosen.add((String) check.getTag());
         }
@@ -437,6 +493,8 @@ public final class MainActivity extends Activity {
                             .putString("remote_code", secret).apply();
                     remoteFiles = new JSONArray();
                     chosen.clear();
+                    linkConnected = false;
+                    prefs.edit().remove("remote_cache").apply();
                     dialog.dismiss();
                     statusMessage = "Подключаюсь...";
                     render();
@@ -452,6 +510,7 @@ public final class MainActivity extends Activity {
         final String key = p.getString("remote_code", "");
         if (rememberedHost.isEmpty() || !key.matches("[0-9]{8}")) return;
         connecting = true;
+        nextReconnectAt = android.os.SystemClock.elapsedRealtime() + 45000;
         statusMessage = "Соединяюсь с POCO...";
         if (linkStatus != null) linkStatus.setText(statusMessage);
         new Thread(new Runnable() {
@@ -473,6 +532,13 @@ public final class MainActivity extends Activity {
                         } catch (Exception e) { failure = e; }
                     }
                 }
+                // Reconcile in this worker thread: SD-card document queries may be slow.
+                if (result != null) {
+                    MediaLibrary.prefs(MainActivity.this).edit()
+                            .putString("remote_host", connectedHost)
+                            .putString("remote_cache", result.toString()).commit();
+                    DownloadQueue.reconcile(MainActivity.this, result, rememberedHost, connectedHost);
+                }
                 final JSONArray episodes = result;
                 final String host = connectedHost;
                 final Exception error = failure;
@@ -481,7 +547,7 @@ public final class MainActivity extends Activity {
                         if (disposed) return;
                         connecting = false;
                         if (episodes != null) {
-                            MediaLibrary.prefs(MainActivity.this).edit().putString("remote_host", host).apply();
+                            linkConnected = true;
                             remoteFiles = episodes;
                             // Preserve already selected episodes when refreshing.
                             Set<String> available = new HashSet<>();
@@ -492,8 +558,13 @@ public final class MainActivity extends Activity {
                             chosen.retainAll(available);
                             statusMessage = "● Подключено к POCO · " + episodes.length() + " серий";
                             render();
+                            if (!DownloadQueue.paused(MainActivity.this)
+                                    && DownloadQueue.waiting(MainActivity.this) > 0) {
+                                startQueueDownload(true);
+                            }
                         } else {
-                            statusMessage = "Нет связи с POCO. Проверь Wi-Fi и раздачу.";
+                            linkConnected = false;
+                            statusMessage = "Нет связи с POCO. Очередь сохранена — проверь Wi-Fi.";
                             if (!automatic && error != null) toast("Подключение: " + error.getMessage());
                             if (linkStatus != null) linkStatus.setText(statusMessage);
                         }
@@ -516,21 +587,59 @@ public final class MainActivity extends Activity {
     }
 
     private void beginDownload() {
-        SharedPreferences p = MediaLibrary.prefs(this);
-        String root = p.getString(MediaLibrary.DEST_TREE, "");
-        if (root.isEmpty()) { toast("Сначала выбери папку на microSD"); return; }
+        if (MediaLibrary.prefs(this).getString(MediaLibrary.DEST_TREE, "").isEmpty()) {
+            toast("Сначала выбери папку на microSD");
+            return;
+        }
         if (chosen.isEmpty()) { toast("Отметь нужные серии"); return; }
-        if (TransferService.downloading) { toast("Загрузка уже идёт"); return; }
         JSONArray selected = new JSONArray();
         for (int i = 0; i < remoteFiles.length(); i++) {
             JSONObject item = remoteFiles.optJSONObject(i);
             if (item != null && chosen.contains(item.optString("id"))) selected.put(item);
         }
+        int added = DownloadQueue.enqueue(this, selected);
+        chosen.clear();
+        DownloadQueue.setPaused(this, false);
+        toast(added > 0 ? "Серии добавлены в очередь" : "Все выбранные серии уже в очереди");
+        render();
+        startQueueDownload(false);
+    }
+
+    private void downloadAllMissing() {
+        if (remoteFiles.length() == 0) { toast("Нет списка серий"); return; }
+        if (MediaLibrary.prefs(this).getString(MediaLibrary.DEST_TREE, "").isEmpty()) {
+            toast("Сначала выбери папку на microSD");
+            return;
+        }
+        int added = DownloadQueue.enqueue(this, remoteFiles);
+        chosen.clear();
+        DownloadQueue.setPaused(this, false);
+        toast(added > 0 ? "Добавлено в очередь: " + added : "Продолжаю сохранённую очередь");
+        render();
+        startQueueDownload(false);
+    }
+
+    /** A saved queue can resume after a reconnect without reselecting episodes. */
+    private void startQueueDownload(boolean automatic) {
+        SharedPreferences p = MediaLibrary.prefs(this);
+        String root = p.getString(MediaLibrary.DEST_TREE, "");
+        if (root.isEmpty()) {
+            if (!automatic) toast("Сначала выбери папку на microSD");
+            return;
+        }
+        if (DownloadQueue.paused(this) && automatic) return;
+        if (TransferService.downloading) return;
+        if (!linkConnected) {
+            if (!automatic) toast("Очередь сохранена. Включи Wi-Fi и раздачу на POCO");
+            return;
+        }
+        JSONArray selected = DownloadQueue.availablePending(this, remoteFiles);
+        if (selected.length() == 0) return;
         String host;
         try { host = DownloadEngine.validatedHost(p.getString("remote_host", "")); }
-        catch (Exception e) { toast("Проверь подключение к телефону"); return; }
+        catch (Exception e) { if (!automatic) toast("Проверь IP телефона"); return; }
         String code = p.getString("remote_code", "");
-        if (!code.matches("[0-9]{8}")) { toast("Укажи код телефона в настройках"); return; }
+        if (!code.matches("[0-9]{8}")) return;
         Intent intent = new Intent(this, TransferService.class);
         intent.putExtra(TransferService.CMD, TransferService.DOWNLOAD);
         intent.putExtra("host", host);
@@ -540,7 +649,6 @@ public final class MainActivity extends Activity {
         TransferService.progressText = "Скачивание " + selected.length() + " серий...";
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent);
         else startService(intent);
-        toast("Загрузка запущена");
     }
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
@@ -556,7 +664,11 @@ public final class MainActivity extends Activity {
                 int granted = data.getFlags() & need;
                 getContentResolver().takePersistableUriPermission(uri, granted);
                 String key = requestCode == PICK_SD_FOLDER ? MediaLibrary.DEST_TREE : MediaLibrary.SOURCE_TREE;
+                String previous = MediaLibrary.prefs(this).getString(key, "");
                 MediaLibrary.prefs(this).edit().putString(key, uri.toString()).apply();
+                if (requestCode == PICK_SD_FOLDER && !previous.equals(uri.toString())) {
+                    DownloadQueue.destinationChanged(this);
+                }
                 if (requestCode == PICK_SOURCE_FOLDER) {
                     MediaLibrary.prefs(this).edit().putBoolean("auto_share", true).apply();
                     TransferService.send(this, TransferService.START_SERVER);

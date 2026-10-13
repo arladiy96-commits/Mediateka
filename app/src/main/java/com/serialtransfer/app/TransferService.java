@@ -41,6 +41,7 @@ public final class TransferService extends Service {
     static volatile String progressText = "Готово к работе";
     static volatile long progressBytes = 0;
     static volatile long progressTotal = -1;
+    static volatile int queueRevision = 0;
 
     private HttpFileServer server;
     private DownloadEngine engine;
@@ -165,12 +166,14 @@ public final class TransferService extends Service {
                         }
                     });
                     engine.download(new JSONArray(finalItems));
-                    if (cancel.get()) progressText = "Пауза. Нажми «Скачать» для продолжения";
-                    else progressText = "Все выбранные серии загружены";
+                    if (cancel.get()) progressText = "Очередь сохранена · загрузка приостановлена";
+                    else progressText = DownloadQueue.waiting(TransferService.this) == 0
+                            ? "Все серии в очереди загружены"
+                            : "Доступные серии загружены · остальные ждут телефон";
                 } catch (Exception error) {
                     progressText = cancel.get()
-                            ? "Пауза. Нажми «Скачать» для продолжения"
-                            : "Ошибка: " + error.getMessage();
+                            ? "Очередь сохранена · загрузка приостановлена"
+                            : "Соединение прервано · очередь сохранена";
                 } finally {
                     engine = null;
                     downloading = false;
@@ -183,6 +186,7 @@ public final class TransferService extends Service {
     }
 
     private void pauseDownload() {
+        DownloadQueue.setPaused(this, true);
         cancel.set(true);
         DownloadEngine current = engine;
         if (current != null) current.interrupt();
