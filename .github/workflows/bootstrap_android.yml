@@ -229,7 +229,9 @@ jobs:
           wrapper_dir="$(mktemp -d)"
           (
             cd "$wrapper_dir"
-            gradle wrapper --gradle-version 8.7 --distribution-type bin
+            # Gradle 8.7 requires a settings file, even for wrapper generation.
+            printf "rootProject.name = 'wrapper-generator'\n" > settings.gradle
+            gradle --no-daemon wrapper --gradle-version 8.7 --distribution-type bin
           )
           mkdir -p gradle
           cp "$wrapper_dir/gradlew" ./gradlew
@@ -242,6 +244,8 @@ jobs:
 
           # The bootstrap workflow itself remains untouched; only project files are added.
           git add settings.gradle build.gradle gradle.properties app/ gradle/ gradlew gradlew.bat .gitignore
+          # Some .gitignore templates exclude *.jar; Gradle Wrapper JAR is required.
+          git add -f gradle/wrapper/gradle-wrapper.jar
           if git diff --cached --quiet; then
             echo "No new project files to commit."
             exit 0
