@@ -1,0 +1,47 @@
+plugins {
+    id 'com.android.application'
+}
+
+def keystoreFile = System.getenv('ANDROID_KEYSTORE_FILE')
+def keystorePassword = System.getenv('ANDROID_KEYSTORE_PASSWORD')
+def keyAliasName = System.getenv('ANDROID_KEY_ALIAS')
+def keyPasswordValue = System.getenv('ANDROID_KEY_PASSWORD')
+def canSignRelease = keystoreFile && keystorePassword && keyAliasName && keyPasswordValue
+
+android {
+    namespace 'com.serialtransfer.app'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.serialtransfer.app'
+        minSdk 24
+        targetSdk 35
+        versionCode (findProperty('buildNumber') ?: '1').toInteger()
+        versionName "0.1.${versionCode}"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    signingConfigs {
+        if (canSignRelease) {
+            release {
+                storeFile file(keystoreFile)
+                storePassword keystorePassword
+                keyAlias keyAliasName
+                keyPassword keyPasswordValue
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (canSignRelease) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+}

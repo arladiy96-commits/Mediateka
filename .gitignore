@@ -33,3 +33,10 @@ google-services.json
 
 # Android Profiling
 *.hprof
+
+# SerialTransfer generated files and signing material
+.gradle/
+**/build/
+local.properties
+*.jks
+*.keystore
