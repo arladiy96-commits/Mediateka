@@ -2,6 +2,11 @@ plugins {
     id 'com.android.application'
 }
 
+// Resolve the build number before entering the Android DSL.
+// Reading it from a Gradle provider also supplies a valid default
+// for local builds without -PbuildNumber.
+def appVersionCode = providers.gradleProperty('buildNumber').orElse('1').get().toInteger()
+
 def keystoreFile = System.getenv('ANDROID_KEYSTORE_FILE')
 def keystorePassword = System.getenv('ANDROID_KEYSTORE_PASSWORD')
 def keyAliasName = System.getenv('ANDROID_KEY_ALIAS')
@@ -16,8 +21,8 @@ android {
         applicationId 'com.serialtransfer.app'
         minSdk 24
         targetSdk 35
-        versionCode (findProperty('buildNumber') ?: '1').toInteger()
-        versionName "0.1.${versionCode}"
+        versionCode = appVersionCode
+        versionName = "0.1.${appVersionCode}"
     }
 
     compileOptions {
