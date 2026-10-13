@@ -222,9 +222,23 @@ jobs:
           *.keystore
           FILE
 
-          echo "Generating the checked-in Gradle Wrapper (Gradle 8.7)..."
-          gradle wrapper --gradle-version 8.7 --distribution-type bin
-          chmod +x gradlew
+          # Generate the wrapper in a clean temporary directory.
+          # Running `gradle wrapper` inside the uninitialized Android project
+          # makes Gradle configure the Android plugin before bootstrap is done.
+          echo "Generating Gradle Wrapper 8.7 in a clean temporary directory..."
+          wrapper_dir="$(mktemp -d)"
+          (
+            cd "$wrapper_dir"
+            gradle wrapper --gradle-version 8.7 --distribution-type bin
+          )
+          mkdir -p gradle
+          cp "$wrapper_dir/gradlew" ./gradlew
+          cp "$wrapper_dir/gradlew.bat" ./gradlew.bat
+          cp -R "$wrapper_dir/gradle/wrapper" ./gradle/
+          rm -rf "$wrapper_dir"
+          chmod +x ./gradlew
+          test -s gradle/wrapper/gradle-wrapper.jar
+          test -s gradle/wrapper/gradle-wrapper.properties
 
           # The bootstrap workflow itself remains untouched; only project files are added.
           git add settings.gradle build.gradle gradle.properties app/ gradle/ gradlew gradlew.bat .gitignore
