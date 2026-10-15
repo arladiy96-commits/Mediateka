@@ -2,22 +2,23 @@ package com.serialtransfer.app;
 
 import android.content.ContentResolver;
 import android.content.Context;
+import android.net.wifi.WifiManager;
+import android.os.PowerManager;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
-import java.io.BufferedWriter;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
-import java.io.OutputStreamWriter;
-import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -25,35 +26,48 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/** Tiny LAN-only HTTP server using the device's content:// sources. */
+/** Lightweight local file server for downloads and streaming to an external player. */
 final class HttpFileServer {
     static final int PORT = 8765;
+
     private final ContentResolver resolver;
+    private final Context appContext;
     private final Map<String, MediaLibrary.Film> byId = new LinkedHashMap<>();
-    private final ExecutorService clients = Executors.newFixedThreadPool(2);
+    private final ExecutorService clients = Executors.newFixedThreadPool(3);
     private final String code;
+    // Streaming tickets change on every server start and do not grant list/download access.
+    private final String streamTicket;
     private volatile boolean running;
     private ServerSocket serverSocket;
 
     HttpFileServer(Context context, List<MediaLibrary.Film> files, String code) {
-        resolver = context.getContentResolver();
+        appContext = context.getApplicationContext();
+        resolver = appContext.getContentResolver();
         this.code = code;
+        byte[] random = new byte[24];
+        new SecureRandom().nextBytes(random);
+        StringBuilder token = new StringBuilder(48);
+        for (byte b : random) token.append(String.format(Locale.US, "%02x", b & 255));
+        streamTicket = token.toString();
         for (MediaLibrary.Film file : files) byId.put(file.id, file);
     }
 
     void start() throws Exception {
-        serverSocket = new ServerSocket(PORT, 8);
+        ServerSocket socket = new ServerSocket();
+        socket.setReuseAddress(true);
+        socket.bind(new InetSocketAddress(PORT), 8);
+        serverSocket = socket;
         running = true;
         Thread listener = new Thread(new Runnable() {
             @Override public void run() {
                 while (running) {
                     try {
-                        final Socket socket = serverSocket.accept();
+                        final Socket accepted = serverSocket.accept();
                         clients.execute(new Runnable() {
-                            @Override public void run() { handle(socket); }
+                            @Override public void run() { handle(accepted); }
                         });
                     } catch (Exception error) {
-                        if (!running) break;
+                        if (!running) return;
                     }
                 }
             }
@@ -70,107 +84,213 @@ final class HttpFileServer {
 
     private void handle(Socket socket) {
         try (Socket s = socket) {
-            // Serve LAN clients only, never requests from a public cellular IP.
             if (!s.getInetAddress().isSiteLocalAddress() && !s.getInetAddress().isLoopbackAddress()) return;
-            s.setSoTimeout(20000);
+            s.setSoTimeout(30000);
             s.setTcpNoDelay(true);
             InputStream in = s.getInputStream();
             OutputStream out = s.getOutputStream();
             BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.US_ASCII));
-            String line = reader.readLine();
-            if (line == null || line.length() > 8192) return;
-            String[] first = line.split(" ");
-            if (first.length < 2 || !"GET".equals(first[0])) {
-                respond(out, 405, "text/plain", "Only GET allowed".getBytes(StandardCharsets.UTF_8));
+            String first = reader.readLine();
+            if (first == null || first.length() > 8192) return;
+            String[] words = first.split(" ");
+            if (words.length < 2) return;
+            boolean head = "HEAD".equals(words[0]);
+            if (!"GET".equals(words[0]) && !head) {
+                respond(out, 405, "Only GET and HEAD supported", false);
                 return;
             }
-            String requestPath = first[1];
+            String rawPath = words[1];
             String providedCode = "";
-            long start = 0;
+            String range = null;
             for (int i = 0; i < 60; i++) {
-                line = reader.readLine();
+                String line = reader.readLine();
                 if (line == null || line.isEmpty()) break;
                 if (line.length() > 8192) return;
-                String lower = line.toLowerCase(Locale.ROOT);
-                if (lower.startsWith("x-media-key:")) providedCode = line.substring(line.indexOf(':') + 1).trim();
-                else if (lower.startsWith("range:")) {
-                    String value = line.substring(line.indexOf(':') + 1).trim();
-                    if (value.startsWith("bytes=") && value.endsWith("-")) {
-                        try { start = Long.parseLong(value.substring(6, value.length() - 1)); }
-                        catch (Exception ignored) { start = 0; }
-                    }
-                }
+                String low = line.toLowerCase(Locale.ROOT);
+                if (low.startsWith("x-media-key:")) providedCode = line.substring(line.indexOf(':') + 1).trim();
+                else if (low.startsWith("range:")) range = line.substring(line.indexOf(':') + 1).trim();
             }
-            if (!code.equals(providedCode)) {
-                respond(out, 403, "text/plain", "Wrong pairing code".getBytes(StandardCharsets.UTF_8));
+            int q = rawPath.indexOf('?');
+            String path = q < 0 ? rawPath : rawPath.substring(0, q);
+            String query = q < 0 ? "" : rawPath.substring(q + 1);
+
+            if ("/stream".equals(path)) {
+                // Third-party video players cannot provide custom HTTP pairing headers.
+                // Permit ONLY streaming with the random ticket issued by authenticated /list.
+                String ticket = queryParam(query, "ticket");
+                if (!ticketMatches(ticket)) {
+                    respond(out, 403, "Streaming ticket invalid", head);
+                    return;
+                }
+                MediaLibrary.Film film = byId.get(queryParam(query, "id"));
+                if (film == null) { respond(out, 404, "File missing", head); return; }
+                sendMedia(out, film, range, head, mimeFor(film.name));
                 return;
             }
-            if (requestPath.equals("/list")) {
+
+            if (!code.equals(providedCode)) {
+                respond(out, 403, "Wrong pairing code", head);
+                return;
+            }
+            if ("/list".equals(path)) {
+                if (head) { respond(out, 405, "GET only", true); return; }
                 JSONObject data = new JSONObject();
-                data.put("protocol", 1);
+                data.put("protocol", 2);
+                data.put("stream_ticket", streamTicket);
                 JSONArray entries = new JSONArray();
                 for (MediaLibrary.Film item : byId.values()) entries.put(item.asJson());
                 data.put("files", entries);
-                respond(out, 200, "application/json; charset=utf-8", data.toString().getBytes(StandardCharsets.UTF_8));
-            } else if (requestPath.startsWith("/file?id=")) {
-                String id = URLDecoder.decode(requestPath.substring(9), "UTF-8");
-                MediaLibrary.Film film = byId.get(id);
-                if (film == null) {
-                    respond(out, 404, "text/plain", "Not found".getBytes(StandardCharsets.UTF_8));
-                    return;
-                }
-                if (start < 0 || (film.size >= 0 && start >= film.size && start != 0)) {
-                    respond(out, 416, "text/plain", "Bad range".getBytes(StandardCharsets.UTF_8));
-                    return;
-                }
-                sendFile(out, film, start);
+                respondJson(out, data.toString());
+            } else if ("/file".equals(path)) {
+                MediaLibrary.Film film = byId.get(queryParam(query, "id"));
+                if (film == null) { respond(out, 404, "File missing", head); return; }
+                sendMedia(out, film, range, head, "application/octet-stream");
             } else {
-                respond(out, 404, "text/plain", "Not found".getBytes(StandardCharsets.UTF_8));
+                respond(out, 404, "Not found", head);
             }
-        } catch (Exception ignored) { /* Client disconnected. */ }
+        } catch (Exception ignored) { /* Disconnected client, canceled seek or invalid request. */ }
     }
 
-    private void sendFile(OutputStream out, MediaLibrary.Film item, long offset) throws Exception {
-        try (InputStream source = resolver.openInputStream(item.uri)) {
-            if (source == null) throw new IllegalStateException("Unable to open source file");
-            long skipped = 0;
-            while (skipped < offset) {
-                long n = source.skip(offset - skipped);
-                if (n <= 0) {
-                    if (source.read() == -1) throw new IllegalStateException("End of file");
-                    n = 1;
+    private boolean ticketMatches(String submitted) {
+        if (submitted == null || submitted.length() != streamTicket.length()) return false;
+        return MessageDigest.isEqual(streamTicket.getBytes(StandardCharsets.US_ASCII),
+                submitted.getBytes(StandardCharsets.US_ASCII));
+    }
+
+    private static String queryParam(String query, String target) throws Exception {
+        for (String segment : query.split("&")) {
+            int eq = segment.indexOf('=');
+            if (eq < 0) continue;
+            if (target.equals(segment.substring(0, eq)))
+                return URLDecoder.decode(segment.substring(eq + 1), "UTF-8");
+        }
+        return "";
+    }
+
+    private static String mimeFor(String filename) {
+        String name = filename.toLowerCase(Locale.ROOT);
+        if (name.endsWith(".mp4") || name.endsWith(".m4v")) return "video/mp4";
+        if (name.endsWith(".mkv")) return "video/x-matroska";
+        if (name.endsWith(".webm")) return "video/webm";
+        if (name.endsWith(".avi")) return "video/x-msvideo";
+        if (name.endsWith(".mov")) return "video/quicktime";
+        if (name.endsWith(".ts")) return "video/mp2t";
+        if (name.endsWith(".3gp")) return "video/3gpp";
+        return "video/*";
+    }
+
+    /** HTTP byte ranges let VLC seek without saving a copy on the receiver. */
+    private void sendMedia(OutputStream out, MediaLibrary.Film film,
+                           String range, boolean head, String type) throws Exception {
+        long size = film.size;
+        long start = 0;
+        long end = size > 0 ? size - 1 : -1;
+        boolean partial = range != null && !range.isEmpty();
+        if (partial) {
+            if (size <= 0 || !range.startsWith("bytes=") || range.indexOf(',') >= 0) {
+                rangeNotSatisfiable(out, size); return;
+            }
+            String request = range.substring("bytes=".length());
+            int dash = request.indexOf('-');
+            if (dash < 0 || dash != request.lastIndexOf('-')) {
+                rangeNotSatisfiable(out, size); return;
+            }
+            String left = request.substring(0, dash);
+            String right = request.substring(dash + 1);
+            try {
+                if (left.isEmpty()) {
+                    long suffix = Long.parseLong(right);
+                    if (suffix <= 0) throw new NumberFormatException();
+                    start = Math.max(0, size - suffix);
+                } else {
+                    start = Long.parseLong(left);
+                    if (!right.isEmpty()) end = Math.min(end, Long.parseLong(right));
                 }
-                skipped += n;
+            } catch (NumberFormatException e) {
+                rangeNotSatisfiable(out, size); return;
             }
-            boolean partial = offset > 0;
-            StringBuilder head = new StringBuilder();
-            head.append(partial ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n");
-            head.append("Content-Type: application/octet-stream\r\n");
-            head.append("Accept-Ranges: bytes\r\n");
-            if (item.size >= 0) {
-                head.append("Content-Length: ").append(item.size - offset).append("\r\n");
-                if (partial) head.append("Content-Range: bytes ").append(offset).append('-')
-                        .append(item.size - 1).append('/').append(item.size).append("\r\n");
+            if (start < 0 || start >= size || end < start) {
+                rangeNotSatisfiable(out, size); return;
             }
-            head.append("Connection: close\r\n\r\n");
-            out.write(head.toString().getBytes(StandardCharsets.US_ASCII));
-            byte[] buffer = new byte[64 * 1024];
-            int length;
-            while ((length = source.read(buffer)) >= 0) {
-                if (length > 0) out.write(buffer, 0, length);
+        }
+        StringBuilder h = new StringBuilder();
+        h.append(partial ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n");
+        h.append("Content-Type: ").append(type).append("\r\n");
+        h.append("Accept-Ranges: ").append(size > 0 ? "bytes" : "none").append("\r\n");
+        h.append("Cache-Control: no-store\r\n");
+        if (size >= 0) h.append("Content-Length: ").append(partial ? end - start + 1 : size).append("\r\n");
+        if (partial) h.append("Content-Range: bytes ").append(start).append('-').append(end)
+                .append('/').append(size).append("\r\n");
+        h.append("Connection: close\r\n\r\n");
+        out.write(h.toString().getBytes(StandardCharsets.US_ASCII));
+        if (head) { out.flush(); return; }
+
+        PowerManager.WakeLock cpuLock = null;
+        WifiManager.WifiLock wifiLock = null;
+        try {
+            PowerManager pm = (PowerManager) appContext.getSystemService(Context.POWER_SERVICE);
+            if (pm != null) {
+                cpuLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Mediateka:Stream");
+                cpuLock.acquire(2 * 60 * 60 * 1000L);
             }
-            out.flush();
+            WifiManager wifi = (WifiManager) appContext.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            if (wifi != null) {
+                wifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "Mediateka:StreamWiFi");
+                wifiLock.acquire();
+            }
+            try (InputStream source = resolver.openInputStream(film.uri)) {
+                if (source == null) throw new IllegalStateException("Video source unavailable");
+                long skipped = 0;
+                while (skipped < start) {
+                    long n = source.skip(start - skipped);
+                    if (n <= 0) {
+                        if (source.read() < 0) return;
+                        n = 1;
+                    }
+                    skipped += n;
+                }
+                byte[] buffer = new byte[32 * 1024];
+                long remaining = size >= 0 ? end - start + 1 : Long.MAX_VALUE;
+                while (remaining > 0) {
+                    int n = source.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+                    if (n < 0) break;
+                    if (n > 0) {
+                        out.write(buffer, 0, n);
+                        remaining -= n;
+                    }
+                }
+                out.flush();
+            }
+        } finally {
+            if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
+            if (cpuLock != null && cpuLock.isHeld()) cpuLock.release();
         }
     }
 
-    private static void respond(OutputStream output, int status, String type, byte[] body) throws Exception {
-        String text = status == 200 ? "OK" : "Error";
-        String header = "HTTP/1.1 " + status + " " + text + "\r\n"
-                + "Content-Type: " + type + "\r\n"
-                + "Content-Length: " + body.length + "\r\n"
-                + "Connection: close\r\n\r\n";
-        output.write(header.getBytes(StandardCharsets.US_ASCII));
-        output.write(body);
-        output.flush();
+    private static void rangeNotSatisfiable(OutputStream out, long size) throws Exception {
+        String response = "HTTP/1.1 416 Range Not Satisfiable\r\n"
+                + (size >= 0 ? "Content-Range: bytes */" + size + "\r\n" : "")
+                + "Content-Length: 0\r\nConnection: close\r\n\r\n";
+        out.write(response.getBytes(StandardCharsets.US_ASCII));
+        out.flush();
+    }
+
+    private static void respondJson(OutputStream out, String body) throws Exception {
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        String header = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+                + "Cache-Control: no-store\r\nContent-Length: " + bytes.length
+                + "\r\nConnection: close\r\n\r\n";
+        out.write(header.getBytes(StandardCharsets.US_ASCII));
+        out.write(bytes);
+        out.flush();
+    }
+
+    private static void respond(OutputStream out, int status, String message, boolean head) throws Exception {
+        byte[] data = message.getBytes(StandardCharsets.UTF_8);
+        String header = "HTTP/1.1 " + status + " Error\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                + "Content-Length: " + data.length + "\r\nConnection: close\r\n\r\n";
+        out.write(header.getBytes(StandardCharsets.US_ASCII));
+        if (!head) out.write(data);
+        out.flush();
     }
 }

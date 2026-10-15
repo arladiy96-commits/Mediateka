@@ -14,6 +14,8 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.DhcpInfo;
 import android.net.Uri;
+import android.content.ActivityNotFoundException;
+import java.net.URLEncoder;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -60,6 +62,7 @@ public final class MainActivity extends Activity {
     private final List<CheckBox> episodeChecks = new ArrayList<>();
     private final Set<String> chosen = new HashSet<>();
     private JSONArray remoteFiles = new JSONArray();
+    private String streamTicket = "";
     private int mode;
     private boolean connecting;
     private boolean disposed;
@@ -190,6 +193,7 @@ public final class MainActivity extends Activity {
         if (mode == next) return;
         mode = next;
         linkConnected = false;
+        streamTicket = "";
         MediaLibrary.prefs(this).edit().putInt("screen", mode).apply();
         render();
         if (mode == 0) startSenderIfRemembered();
@@ -344,7 +348,7 @@ public final class MainActivity extends Activity {
         }
         sectionTitle("Доступные серии", remoteFiles.length() == 0 ?
                 "После подключения здесь появится библиотека телефона." :
-                "Уже скачанное отмечается автоматически. Можно выбрать оставшиеся серии.");
+                "▶ — смотреть по Wi-Fi без скачивания; галочка — добавить в очередь.");
         if (remoteFiles.length() > 0) {
             int finished = 0;
             int missing = 0;
@@ -400,7 +404,17 @@ public final class MainActivity extends Activity {
                     if (selected) chosen.add(id); else chosen.remove(id);
                     updateDownloadButton();
                 });
-                listing.addView(check, new LinearLayout.LayoutParams(-1, -2));
+                LinearLayout episodeRow = row();
+                episodeRow.addView(check, new LinearLayout.LayoutParams(0, -2, 1));
+                Button play = button("▶", false);
+                play.setContentDescription("Смотреть: " + episode.optString("name", "Серия"));
+                LinearLayout.LayoutParams playParams = new LinearLayout.LayoutParams(dp(46), dp(45));
+                playParams.leftMargin = dp(3);
+                episodeRow.addView(play, playParams);
+                play.setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View v) { openStream(id); }
+                });
+                listing.addView(episodeRow, new LinearLayout.LayoutParams(-1, -2));
                 episodeChecks.add(check);
                 if (i != remoteFiles.length() - 1) {
                     View line = new View(this);
@@ -494,6 +508,7 @@ public final class MainActivity extends Activity {
                     remoteFiles = new JSONArray();
                     chosen.clear();
                     linkConnected = false;
+                    streamTicket = "";
                     prefs.edit().remove("remote_cache").apply();
                     dialog.dismiss();
                     statusMessage = "Подключаюсь...";
@@ -518,15 +533,21 @@ public final class MainActivity extends Activity {
                 String connectedHost = rememberedHost;
                 JSONArray result = null;
                 Exception failure = null;
-                try { result = new JSONObject(DownloadEngine.list(connectedHost, key)).getJSONArray("files"); }
-                catch (Exception e) { failure = e; }
+                String ticket = "";
+                try {
+                    JSONObject listing = new JSONObject(DownloadEngine.list(connectedHost, key));
+                    result = listing.getJSONArray("files");
+                    ticket = listing.optString("stream_ticket", "");
+                } catch (Exception e) { failure = e; }
                 // An Android hotspot can change its IP after a reboot. The Wi-Fi
                 // gateway usually points to the sender when POCO hosts the hotspot.
                 if (result == null) {
                     String gateway = wifiGateway();
                     if (!gateway.isEmpty() && !gateway.equals(rememberedHost)) {
                         try {
-                            result = new JSONObject(DownloadEngine.list(gateway, key)).getJSONArray("files");
+                            JSONObject listing = new JSONObject(DownloadEngine.list(gateway, key));
+                            result = listing.getJSONArray("files");
+                            ticket = listing.optString("stream_ticket", "");
                             connectedHost = gateway;
                             failure = null;
                         } catch (Exception e) { failure = e; }
@@ -540,6 +561,7 @@ public final class MainActivity extends Activity {
                     DownloadQueue.reconcile(MainActivity.this, result, rememberedHost, connectedHost);
                 }
                 final JSONArray episodes = result;
+                final String playbackTicket = ticket;
                 final String host = connectedHost;
                 final Exception error = failure;
                 runOnUiThread(new Runnable() {
@@ -548,6 +570,7 @@ public final class MainActivity extends Activity {
                         connecting = false;
                         if (episodes != null) {
                             linkConnected = true;
+                            streamTicket = playbackTicket;
                             remoteFiles = episodes;
                             // Preserve already selected episodes when refreshing.
                             Set<String> available = new HashSet<>();
@@ -564,6 +587,7 @@ public final class MainActivity extends Activity {
                             }
                         } else {
                             linkConnected = false;
+                            streamTicket = "";
                             statusMessage = "Нет связи с POCO. Очередь сохранена — проверь Wi-Fi.";
                             if (!automatic && error != null) toast("Подключение: " + error.getMessage());
                             if (linkStatus != null) linkStatus.setText(statusMessage);
@@ -584,6 +608,35 @@ public final class MainActivity extends Activity {
             return String.format(Locale.US, "%d.%d.%d.%d", value & 255,
                     (value >> 8) & 255, (value >> 16) & 255, (value >> 24) & 255);
         } catch (Exception ignored) { return ""; }
+    }
+
+    /** Stream in a third-party video player, such as VLC, without saving on this device. */
+    private void openStream(String episodeId) {
+        if (!linkConnected || !streamTicket.matches("[0-9a-f]{48}")) {
+            toast("Нет ссылки для просмотра. Обнови раздачу на POCO и список серий.");
+            return;
+        }
+        if (!episodeId.matches("[0-9a-f]{24}")) {
+            toast("Неверный файл");
+            return;
+        }
+        try {
+            String host = DownloadEngine.validatedHost(
+                    MediaLibrary.prefs(this).getString("remote_host", ""));
+            String url = "http://" + host + ":" + HttpFileServer.PORT
+                    + "/stream?id=" + URLEncoder.encode(episodeId, "UTF-8")
+                    + "&ticket=" + URLEncoder.encode(streamTicket, "UTF-8");
+            Intent intent = new Intent(Intent.ACTION_VIEW);
+            intent.setDataAndType(Uri.parse(url), "video/*");
+            intent.addCategory(Intent.CATEGORY_DEFAULT);
+            try {
+                startActivity(Intent.createChooser(intent, "Смотреть через видеоплеер"));
+            } catch (ActivityNotFoundException notInstalled) {
+                toast("Установи VLC или другой плеер для сетевого видео");
+            }
+        } catch (Exception problem) {
+            toast("Не удалось открыть видео: " + problem.getMessage());
+        }
     }
 
     private void beginDownload() {
