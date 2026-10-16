@@ -93,10 +93,38 @@ final class MediaLibrary {
         }
         Collections.sort(films, new Comparator<Film>() {
             @Override public int compare(Film a, Film b) {
-                return a.name.compareToIgnoreCase(b.name);
+                return naturalCompare(a.name, b.name);
             }
         });
         return films;
+    }
+
+    /** Numeric episode order: episode 2 before episode 10. */
+    private static int naturalCompare(String left, String right) {
+        int i = 0, j = 0;
+        while (i < left.length() && j < right.length()) {
+            char a = left.charAt(i), b = right.charAt(j);
+            if (Character.isDigit(a) && Character.isDigit(b)) {
+                int ai = i, bj = j;
+                while (ai < left.length() && left.charAt(ai) == '0') ai++;
+                while (bj < right.length() && right.charAt(bj) == '0') bj++;
+                int ae = ai, be = bj;
+                while (ae < left.length() && Character.isDigit(left.charAt(ae))) ae++;
+                while (be < right.length() && Character.isDigit(right.charAt(be))) be++;
+                if ((ae - ai) != (be - bj)) return (ae - ai) < (be - bj) ? -1 : 1;
+                for (int k = 0; k < ae - ai; k++) {
+                    if (left.charAt(ai+k) != right.charAt(bj+k))
+                        return left.charAt(ai+k) < right.charAt(bj+k) ? -1 : 1;
+                }
+                while (i < left.length() && Character.isDigit(left.charAt(i))) i++;
+                while (j < right.length() && Character.isDigit(right.charAt(j))) j++;
+                continue;
+            }
+            char x = Character.toLowerCase(a), y = Character.toLowerCase(b);
+            if (x != y) return x < y ? -1 : 1;
+            i++; j++;
+        }
+        return Integer.compare(left.length() - i, right.length() - j);
     }
 
     private static void scanTree(ContentResolver resolver, Uri root, List<Film> out, Set<String> known) {

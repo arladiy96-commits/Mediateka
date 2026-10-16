@@ -13,6 +13,7 @@ import java.util.UUID;
 
 /** The receiver initiates all connections, so Android hotspot clients need no inbound server. */
 final class RemoteControlClient {
+    private static int watchCycle;
     private RemoteControlClient() { }
 
     private static String encode(String s) throws Exception { return URLEncoder.encode(s, "UTF-8"); }
@@ -45,6 +46,13 @@ final class RemoteControlClient {
         return get("127.0.0.1", code, "/remote/devices").getJSONArray("devices");
     }
 
+    static void seek(String code, String device, int positionMs) throws Exception {
+        String route = "/remote/send?device=" + encode(device) + "&action=seek_to&ms="
+                + Math.max(0, positionMs);
+        if (!get("127.0.0.1", code, route).optBoolean("ok"))
+            throw new IllegalStateException("Команда не доставлена");
+    }
+
     static void send(String code, String device, String action, String filmId) throws Exception {
         String route = "/remote/send?device=" + encode(device) + "&action=" + encode(action)
                 + "&id=" + encode(filmId == null ? "" : filmId);
@@ -60,6 +68,32 @@ final class RemoteControlClient {
         }
         String model = Build.MANUFACTURER + " " + Build.MODEL;
         String route = "/remote/poll?device=" + encode(id) + "&name=" + encode(model);
+        route += "&player_id=" + encode(RemotePlayerActivity.playbackId)
+                + "&player_position=" + Math.max(0, RemotePlayerActivity.playbackPosition)
+                + "&player_duration=" + Math.max(0, RemotePlayerActivity.playbackDuration)
+                + "&player_playing=" + (RemotePlayerActivity.playbackPlaying ? "1" : "0");
+        JSONObject watch = WatchHistory.last(context);
+        if ((++watchCycle % 3) == 0) {
+            try {
+                java.util.ArrayList<String> keys = new java.util.ArrayList<>();
+                for (String key : MediaLibrary.prefs(context).getAll().keySet()) {
+                    if (key.startsWith("watch_bookmark_v1_")) keys.add(key);
+                }
+                java.util.Collections.sort(keys);
+                if (!keys.isEmpty()) {
+                    String entry = MediaLibrary.prefs(context)
+                            .getString(keys.get((watchCycle / 3) % keys.size()), "");
+                    watch = new JSONObject(entry);
+                }
+            } catch (Exception ignored) { }
+        }
+        if (watch != null) {
+            route += "&watch_id=" + encode(watch.optString("id", ""))
+                    + "&watch_position=" + Math.max(0, watch.optInt("position"))
+                    + "&watch_duration=" + Math.max(0, watch.optInt("duration"))
+                    + "&watch_finished=" + (watch.optBoolean("finished") ? "1" : "0")
+                    + "&watch_updated=" + Math.max(0, watch.optLong("updated"));
+        }
         return get(host, code, route);
     }
 }

@@ -26,6 +26,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
 import android.widget.CheckBox;
+import android.widget.SeekBar;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -60,6 +61,9 @@ public final class MainActivity extends Activity {
     private LinearLayout targetsPanel;
     private LinearLayout remoteLibraryPanel;
     private TextView remoteMessage;
+    private LinearLayout resumeCard;
+    private TextView resumeDetails;
+    private Button resumeWatchButton;
     private String chosenDevice = "";
     private long nextDevicesAt;
     private volatile boolean refreshingDevices;
@@ -70,6 +74,11 @@ public final class MainActivity extends Activity {
     private TextView transferStatus;
     private Button downloadButton;
     private Button pauseButton;
+    private SeekBar remoteSeek;
+    private TextView remoteNow;
+    private TextView remotePlaying;
+    private long nextCatalogCheck;
+    private boolean diagnosticsRunning;
     private final List<CheckBox> episodeChecks = new ArrayList<>();
     private final Set<String> chosen = new HashSet<>();
     private JSONArray remoteFiles = new JSONArray();
@@ -109,6 +118,7 @@ public final class MainActivity extends Activity {
                 compactStatus.setTextColor(active ? ACCENT : MUTED);
             }
             if (pauseButton != null) pauseButton.setVisibility(TransferService.downloading ? View.VISIBLE : View.GONE);
+            if (mode == 0 && page == 0) updateResumeCard();
             if (transferStatus != null) {
                 String description = TransferService.progressText;
                 if (TransferService.downloading && TransferService.progressTotal > 0) {
@@ -125,10 +135,9 @@ public final class MainActivity extends Activity {
             // A manual pause deliberately disables automatic resuming.
             long now = android.os.SystemClock.elapsedRealtime();
             if (mode == 1 && now >= nextReconnectAt && !connecting
-                    && !TransferService.downloading && !DownloadQueue.paused(MainActivity.this)
-                    && DownloadQueue.waiting(MainActivity.this) > 0) {
-                nextReconnectAt = now + 45000;
-                connectSaved(true);
+                    && !TransferService.downloading) {
+                nextReconnectAt = now + (linkConnected ? 75000 : 18000);
+                connectSaved(true); // refresh catalogue and recover even with an empty download queue
             }
             if (mode == 0 && TransferService.serverRunning && targetsPanel != null
                     && now >= nextDevicesAt && !refreshingDevices) {
@@ -186,11 +195,17 @@ public final class MainActivity extends Activity {
         targetsPanel = null;
         remoteLibraryPanel = null;
         remoteMessage = null;
+        resumeCard = null;
+        resumeDetails = null;
+        resumeWatchButton = null;
         linkStatus = null;
         transferStatus = null;
         downloadButton = null;
         pauseButton = null;
         compactStatus = null;
+        remoteSeek = null;
+        remoteNow = null;
+        remotePlaying = null;
         episodeChecks.clear();
 
         LinearLayout screen = column();
@@ -414,6 +429,29 @@ public final class MainActivity extends Activity {
                 rowActions("◀◀", "▶▶", v -> sendToRemote("previous", ""), v -> sendToRemote("next", ""));
                 rowActions("−30 сек", "+30 сек", v -> sendToRemote("seek_back", ""), v -> sendToRemote("seek_forward", ""));
                 rowActions("Пауза", "▶ Продолжить", v -> sendToRemote("pause", ""), v -> sendToRemote("resume", ""));
+                // Current playback state is received every few seconds from the receiver.
+                LinearLayout playback = slimPanel();
+                remotePlaying = text("Ожидание данных плеера…", 13, WHITE, true);
+                playback.addView(remotePlaying);
+                remoteNow = text("", 12, MUTED, false);
+                playback.addView(remoteNow, spaced(6, 2));
+                remoteSeek = new SeekBar(this);
+                remoteSeek.setMax(1000);
+                remoteSeek.setProgressTintList(ColorStateList.valueOf(ACCENT));
+                remoteSeek.setThumbTintList(ColorStateList.valueOf(ACCENT));
+                remoteSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                    boolean dragging;
+                    @Override public void onStartTrackingTouch(SeekBar seek) { dragging = true; }
+                    @Override public void onProgressChanged(SeekBar seek, int value, boolean fromUser) { }
+                    @Override public void onStopTrackingTouch(SeekBar seek) {
+                        dragging = false;
+                        int duration = MediaLibrary.prefs(MainActivity.this)
+                                .getInt("remote_duration_v7_" + chosenDevice, 0);
+                        if (duration > 0) seekRemote((int)((long)seek.getProgress() * duration / 1000L));
+                    }
+                });
+                playback.addView(remoteSeek);
+                content.addView(playback, spaced(9, 8));
                 rowActions("− Громкость", "+ Громкость", v -> sendToRemote("volume_down", ""), v -> sendToRemote("volume_up", ""));
                 link("■  Остановить воспроизведение", v -> sendToRemote("stop", ""));
             }
@@ -457,7 +495,12 @@ public final class MainActivity extends Activity {
                 MediaLibrary.prefs(this).edit().putBoolean("auto_share", false).apply();
                 TransferService.send(this, TransferService.STOP_SERVER);
             });
-            note("IP и код вводятся на новом устройстве только при первом сопряжении.");
+            note("IP и код вводятся один раз. В домашней сети устройства ищутся автоматически.");
+            settingsSwitch("Автопереход к следующей серии", "auto_next_episode_v7", true);
+            settingsSwitch("Запоминать громкость плеера", "remember_volume_v7", false);
+            settingsSwitch("Открывать во внешнем плеере (без удалённой перемотки и истории)",
+                    "prefer_vlc_v7", false);
+            action("Диагностика Wi-Fi", false, v -> diagnoseNetwork());
             cardRow("▤", "Папки и файлы", "Добавить или убрать видео", "›", v -> navigate(2));
         } else {
             pageTitle(openCollection.isEmpty() ? "Мои сериалы" : openCollection,
@@ -465,6 +508,23 @@ public final class MainActivity extends Activity {
             cardRow("▣", chosenDevice.isEmpty() ? "Выбрать экран" : "Экран выбран",
                     chosenDevice.isEmpty() ? "Huawei, приставка или магнитола" : "Управление доступно на вкладке Устройства",
                     "›", v -> navigate(1));
+            resumeCard = slimPanel();
+            resumeCard.addView(text("Продолжить просмотр", 15, WHITE, true));
+            resumeDetails = text("", 12, MUTED, false);
+            resumeCard.addView(resumeDetails, spaced(7, 9));
+            resumeWatchButton = button("▶  Продолжить на устройстве", true);
+            resumeCard.addView(resumeWatchButton, spaced(6, 0));
+            resumeWatchButton.setOnClickListener(v -> {
+                try {
+                    JSONObject watch = new JSONObject(MediaLibrary.prefs(this)
+                            .getString("remote_watch_" + chosenDevice, ""));
+                    String episode = watch.optString("id", "");
+                    if (!episode.matches("[0-9a-f]{24}")) { toast("История просмотра не найдена"); return; }
+                    sendToRemote("play", episode);
+                } catch (Exception ignored) { toast("История просмотра не найдена"); }
+            });
+            content.addView(resumeCard, spaced(0, 10));
+            updateResumeCard();
             remoteLibraryPanel = column();
             remoteLibraryPanel.addView(text("Загружаю библиотеку…", 12, MUTED, false));
             content.addView(remoteLibraryPanel, spaced(8, 10));
@@ -479,6 +539,39 @@ public final class MainActivity extends Activity {
                 && prefs.getString("remote_code", "").matches("[0-9]{8}")) {
             TransferService.send(this, TransferService.START_RECEIVER);
         }
+    }
+
+    private static String clock(int ms) {
+        long seconds = Math.max(0, ms) / 1000L;
+        return String.format(Locale.US, "%02d:%02d", seconds / 60, seconds % 60);
+    }
+
+    private void seekRemote(final int positionMs) {
+        final String target = chosenDevice;
+        if (target.isEmpty()) return;
+        actions.execute(() -> {
+            try { RemoteControlClient.seek(TransferService.accessCode, target, positionMs); }
+            catch (Exception e) { runOnUiThread(() -> { if (!disposed) toast("Перемотка: " + e.getMessage()); }); }
+        });
+    }
+
+    private void updateRemoteProgress(JSONObject state) {
+        String id = state.optString("player_id", "");
+        int current = state.optInt("position", 0);
+        int duration = state.optInt("duration", 0);
+        boolean playing = state.optBoolean("playing", false);
+        MediaLibrary.prefs(this).edit().putInt("remote_duration_v7_" + chosenDevice, duration).apply();
+        if (remotePlaying != null) {
+            String name = "Нет активного просмотра";
+            if (id.matches("[0-9a-f]{24}")) {
+                name = id;
+                name = state.optString("player_name", "Серия воспроизводится");
+            }
+            remotePlaying.setText((playing ? "▶ " : "Ⅱ ") + name);
+        }
+        if (remoteNow != null) remoteNow.setText(clock(current) + " / " + clock(duration));
+        if (remoteSeek != null && duration > 0 && !remoteSeek.isPressed())
+            remoteSeek.setProgress((int)Math.min(1000, ((long)current * 1000L / duration)));
     }
 
     private void refreshRemoteDevices() {
@@ -504,7 +597,11 @@ public final class MainActivity extends Activity {
                     String id = device.optString("id", "");
                     String label = device.optString("name", "Android");
                     boolean active = chosenDevice.equals(id);
-                    if (active) deviceLabel = label;
+                    if (active) updateRemoteProgress(device);
+                    if (chosenDevice.isEmpty() && found.length() == 1) {
+                        chosenDevice = id;
+                        MediaLibrary.prefs(this).edit().putString("selected_remote_device", id).apply();
+                    }
                     LinearLayout line = row();
                     LinearLayout title = column();
                     title.addView(text((active ? "● " : "○ ") + label, 14, active ? ACCENT : WHITE, true));
@@ -574,7 +671,18 @@ public final class MainActivity extends Activity {
                         TextView name = text(cleanFilename(f.name), 13, WHITE, true);
                         name.setMaxLines(2);
                         info.addView(name);
-                        info.addView(text(MediaLibrary.readableSize(f.size), 11, MUTED, false), spaced(3, 0));
+                        String detail = MediaLibrary.readableSize(f.size);
+                        if (!chosenDevice.isEmpty()) {
+                            String history = MediaLibrary.prefs(this).getString(
+                                    "remote_watch_" + chosenDevice + "_" + f.id, "");
+                            try {
+                                JSONObject item = new JSONObject(history);
+                                if (item.optBoolean("finished")) detail += "  ·  ✓ Просмотрено";
+                                else if (item.optInt("position") > 5000)
+                                    detail += "  ·  Продолжить с " + clock(item.optInt("position"));
+                            } catch (Exception ignored) { }
+                        }
+                        info.addView(text(detail, 11, MUTED, false), spaced(3, 0));
                         inner.addView(info, new LinearLayout.LayoutParams(0, -2, 1));
                         Button play = button("▶", true);
                         inner.addView(play, new LinearLayout.LayoutParams(dp(47), dp(44)));
@@ -700,12 +808,24 @@ public final class MainActivity extends Activity {
             thinHeading("Хранилище", null, null);
             cardRow("▱", tree.isEmpty() ? "microSD не выбрана" : "microSD подключена",
                     "Выбрать папку для фильмов", "›", v -> destinationPicker());
-            note("Очередь загрузок и уже скачанные серии сохраняются. Для обновления библиотеки открой «Телефон».");
+            settingsSwitch("Автопереход к следующей серии", "auto_next_episode_v7", true);
+            settingsSwitch("Запоминать громкость плеера", "remember_volume_v7", false);
+            settingsSwitch("Открывать во внешнем плеере (без удалённой перемотки и истории)",
+                    "prefer_vlc_v7", false);
+            action("Диагностика Wi-Fi", false, v -> diagnoseNetwork());
+            note("Очередь загрузок и уже скачанные серии сохраняются. Автопоиск работает в домашней сети и точке доступа, когда маршрутизатор разрешает обмен между устройствами.");
         } else {
             pageTitle(openCollection.isEmpty() ? "Мои сериалы" : openCollection,
                     openCollection.isEmpty() ? "Смотреть или скачать с POCO" : "Выбери нужную серию");
             cardRow("▣", paired ? (linkConnected ? "POCO подключён" : "POCO — соединение сохранено") : "Подключить POCO",
                     paired ? "Открыть управление соединением" : "Один раз введи IP и код", "›", v -> navigate(1));
+            JSONObject latest = WatchHistory.last(this);
+            if (latest != null && !latest.optBoolean("finished")
+                    && WatchHistory.resumeAt(this, latest.optString("id")) > 0) {
+                final String resumeId = latest.optString("id");
+                cardRow("▶", "Продолжить просмотр", latest.optString("name", "Серия")
+                        + " · " + clock(latest.optInt("position")), "›", v -> openStream(resumeId));
+            }
             if (remoteFiles.length() == 0) {
                 cardRow("▱", "Список пока пуст", "Подключись к телефону и обнови серии", "", null);
                 action(paired ? "Обновить сериалы" : "Подключить телефон", true,
@@ -745,6 +865,12 @@ public final class MainActivity extends Activity {
                     String stateLabel = downloaded ? "✓ Скачано" : waiting ? "◷ В очереди" :
                             DownloadQueue.PARTIAL.equals(state) ? "↻ Продолжить" :
                                     MediaLibrary.readableSize(episode.optLong("size", -1));
+                    JSONObject watched = WatchHistory.item(this, id);
+                    if (watched != null) {
+                        if (watched.optBoolean("finished")) stateLabel += "  ·  ✓ Просмотрено";
+                        else if (watched.optInt("position") >= 5000)
+                            stateLabel += "  ·  " + clock(watched.optInt("position"));
+                    }
                     LinearLayout card = slimPanel();
                     LinearLayout line = row();
                     CheckBox check = new CheckBox(this);
@@ -813,6 +939,27 @@ public final class MainActivity extends Activity {
         downloadButton.setAlpha(selected > 0 ? 1f : .55f);
     }
 
+    private void updateResumeCard() {
+        if (resumeCard == null || resumeDetails == null || resumeWatchButton == null) return;
+        try {
+            JSONObject item = new JSONObject(MediaLibrary.prefs(this)
+                    .getString("remote_watch_" + chosenDevice, ""));
+            String id = item.optString("id", "");
+            int position = item.optInt("position", 0);
+            int duration = item.optInt("duration", 0);
+            boolean ready = id.matches("[0-9a-f]{24}") && position >= 5000
+                    && !item.optBoolean("finished")
+                    && (duration <= 0 || duration - position >= 15000);
+            resumeCard.setVisibility(ready ? View.VISIBLE : View.GONE);
+            if (!ready) return;
+            String name = item.optString("name", "Серия");
+            int seconds = Math.max(0, position / 1000);
+            String stamp = String.format(Locale.US, "%02d:%02d:%02d",
+                    seconds / 3600, (seconds / 60) % 60, seconds % 60);
+            resumeDetails.setText(name + "\nСохранено на " + stamp + " · можно продолжить после перезапуска");
+        } catch (Exception ignored) { resumeCard.setVisibility(View.GONE); }
+    }
+
     private void setAll(boolean selected) {
         chosen.clear();
         for (CheckBox check : episodeChecks) {
@@ -821,6 +968,46 @@ public final class MainActivity extends Activity {
             if (selected) chosen.add((String) check.getTag());
         }
         updateDownloadButton();
+    }
+
+    private void settingsSwitch(String title, String key, boolean defaultValue) {
+        CheckBox check = new CheckBox(this);
+        check.setText(title);
+        check.setTextSize(13);
+        check.setTextColor(WHITE);
+        check.setButtonTintList(ColorStateList.valueOf(ACCENT));
+        check.setChecked(MediaLibrary.prefs(this).getBoolean(key, defaultValue));
+        check.setOnCheckedChangeListener((v, enabled) -> MediaLibrary.prefs(this)
+                .edit().putBoolean(key, enabled).apply());
+        content.addView(check, spaced(5, 5));
+    }
+
+    private void diagnoseNetwork() {
+        if (diagnosticsRunning) return;
+        diagnosticsRunning = true;
+        Toast.makeText(this, "Проверяю Wi-Fi…", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            SharedPreferences p = MediaLibrary.prefs(this);
+            String storedHost = p.getString("remote_host", "");
+            String code = p.getString("remote_code", "");
+            java.util.List<String> found = LanDiscovery.find(this);
+            boolean storedWorks = false;
+            if (!storedHost.isEmpty() && code.matches("[0-9]{8}")) {
+                try { DownloadEngine.list(storedHost, code); storedWorks = true; }
+                catch (Exception ignored) { }
+            }
+            final String message = "IP POCO (если сервер включён): " + TransferService.serverIp
+                    + "\nАдрес сохранён: " + (storedHost.isEmpty() ? "нет" : storedHost)
+                    + "\nСохранённый адрес: " + (storedWorks ? "доступен" : "не отвечает или неверный код")
+                    + "\nПоиск в сети: " + (found.isEmpty() ? "ничего не найдено" : found.toString())
+                    + "\n\nЕсли поиск пуст, проверь гостевую сеть, изоляцию клиентов и что оба устройства в одной сети Wi-Fi.";
+            runOnUiThread(() -> {
+                diagnosticsRunning = false;
+                if (!disposed) new AlertDialog.Builder(this)
+                        .setTitle("Диагностика подключения").setMessage(message)
+                        .setPositiveButton("Понятно", null).show();
+            });
+        }, "MediatekaNetworkCheck").start();
     }
 
     /** Stores the pairing once. Existing pairings can be adjusted under Settings. */
@@ -900,6 +1087,20 @@ public final class MainActivity extends Activity {
                         } catch (Exception e) { failure = e; }
                     }
                 }
+                // Home routers have a different gateway: use UDP discovery, then verify
+                // each candidate with the previously paired secret before trusting it.
+                if (result == null) {
+                    for (String candidate : LanDiscovery.find(MainActivity.this)) {
+                        try {
+                            JSONObject listing = new JSONObject(DownloadEngine.list(candidate, key));
+                            result = listing.getJSONArray("files");
+                            ticket = listing.optString("stream_ticket", "");
+                            connectedHost = candidate;
+                            failure = null;
+                            break;
+                        } catch (Exception rejected) { failure = rejected; }
+                    }
+                }
                 // Reconcile in this worker thread: SD-card document queries may be slow.
                 if (result != null) {
                     MediaLibrary.prefs(MainActivity.this).edit()
@@ -962,7 +1163,7 @@ public final class MainActivity extends Activity {
         } catch (Exception ignored) { return ""; }
     }
 
-    /** Stream in a third-party video player, such as VLC, without saving on this device. */
+    /** The internal player owns resume bookmarks. It may open VLC on request. */
     private void openStream(String episodeId) {
         if (!linkConnected || !streamTicket.matches("[0-9a-f]{48}")) {
             toast("Нет ссылки для просмотра. Обнови раздачу на POCO и список серий.");
@@ -978,14 +1179,11 @@ public final class MainActivity extends Activity {
             String url = "http://" + host + ":" + HttpFileServer.PORT
                     + "/stream?id=" + URLEncoder.encode(episodeId, "UTF-8")
                     + "&ticket=" + URLEncoder.encode(streamTicket, "UTF-8");
-            Intent intent = new Intent(Intent.ACTION_VIEW);
-            intent.setDataAndType(Uri.parse(url), "video/*");
-            intent.addCategory(Intent.CATEGORY_DEFAULT);
-            try {
-                startActivity(Intent.createChooser(intent, "Смотреть через видеоплеер"));
-            } catch (ActivityNotFoundException notInstalled) {
-                toast("Установи VLC или другой плеер для сетевого видео");
-            }
+            Intent intent = new Intent(this, RemotePlayerActivity.class);
+            intent.putExtra("remote_action", "play");
+            intent.putExtra("remote_id", episodeId);
+            intent.putExtra("remote_ticket", streamTicket);
+            startActivity(intent);
         } catch (Exception problem) {
             toast("Не удалось открыть видео: " + problem.getMessage());
         }

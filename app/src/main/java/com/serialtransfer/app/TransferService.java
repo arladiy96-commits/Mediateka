@@ -51,6 +51,10 @@ public final class TransferService extends Service {
     static volatile int queueRevision = 0;
 
     private HttpFileServer server;
+    private volatile boolean indexRunning;
+    private Thread indexThread;
+    private long nextDiscoveryAt;
+    private long nextServiceRetryAt;
     private DownloadEngine engine;
     private final AtomicBoolean cancel = new AtomicBoolean(false);
     private PowerManager.WakeLock wake;
@@ -68,7 +72,19 @@ public final class TransferService extends Service {
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent == null) return START_NOT_STICKY;
+        if (intent == null) {
+            android.content.SharedPreferences saved = MediaLibrary.prefs(this);
+            if (saved.getInt("screen", 0) == 0 && saved.getBoolean("auto_share", true)
+                    && (!saved.getString(MediaLibrary.SOURCE_TREE, "").isEmpty()
+                    || !saved.getStringSet(MediaLibrary.SOURCE_FILES,
+                        java.util.Collections.<String>emptySet()).isEmpty())) {
+                startServer();
+            } else if (saved.getInt("screen", 0) == 1
+                    && saved.getString("remote_code", "").matches("[0-9]{8}")) {
+                startReceiver();
+            } else stopIfIdle();
+            return START_STICKY;
+        }
         String command = intent.getStringExtra(CMD);
         if (START_SERVER.equals(command)) startServer();
         else if (STOP_SERVER.equals(command)) stopServer();
@@ -76,7 +92,7 @@ public final class TransferService extends Service {
         else if (PAUSE.equals(command)) pauseDownload();
         else if (START_RECEIVER.equals(command)) startReceiver();
         else if (STOP_RECEIVER.equals(command)) stopReceiver();
-        return START_NOT_STICKY;
+        return START_STICKY;
     }
 
     /** Receiver polls the phone; no inbound sockets or new pairing necessary. */
@@ -103,7 +119,25 @@ public final class TransferService extends Service {
                                 handleRemoteCommand(command);
                             }
                         }
-                    } catch (Exception ignored) { /* retry after Wi-Fi is restored */ }
+                    } catch (Exception ignored) {
+                        long now = android.os.SystemClock.elapsedRealtime();
+                        if (now >= nextDiscoveryAt) {
+                            nextDiscoveryAt = now + 18000;
+                            try {
+                                android.content.SharedPreferences p = MediaLibrary.prefs(TransferService.this);
+                                String secret = p.getString("remote_code", "");
+                                if (secret.matches("[0-9]{8}")) {
+                                    for (String candidate : LanDiscovery.find(TransferService.this)) {
+                                        try {
+                                            DownloadEngine.list(candidate, secret);
+                                            p.edit().putString("remote_host", candidate).commit();
+                                            break;
+                                        } catch (Exception invalid) { }
+                                    }
+                                }
+                            } catch (Exception ignoredDiscovery) { }
+                        }
+                    }
                     try { Thread.sleep(2500); } catch (InterruptedException interrupted) { break; }
                 }
             }
@@ -125,6 +159,7 @@ public final class TransferService extends Service {
                 .putExtra("remote_action", action)
                 .putExtra("remote_id", command.optString("id", ""))
                 .putExtra("remote_ticket", command.optString("ticket", ""));
+        if ("seek_to".equals(action)) player.putExtra("remote_ms", command.optInt("ms", 0));
         player.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP
                 | Intent.FLAG_ACTIVITY_CLEAR_TOP);
         if (RemotePlayerActivity.visible) {
@@ -182,6 +217,7 @@ public final class TransferService extends Service {
                     accessCode = code;
                     serverIp = localIpv4();
                     serverRunning = true;
+                    launchIndexRefresh();
                     progressText = "Раздача включена · " + entries.size() + " файлов";
                     notice(progressText);
                 } catch (Exception failure) {
@@ -194,7 +230,29 @@ public final class TransferService extends Service {
         }, "StartMediaServer").start();
     }
 
+    private void launchIndexRefresh() {
+        indexRunning = true;
+        if (indexThread != null) indexThread.interrupt();
+        indexThread = new Thread(() -> {
+            while (indexRunning && serverRunning) {
+                try { Thread.sleep(90000); }
+                catch (InterruptedException stopped) { return; }
+                if (!indexRunning || !serverRunning) break;
+                try {
+                    List<MediaLibrary.Film> latest = MediaLibrary.scan(TransferService.this);
+                    HttpFileServer active = server;
+                    if (active != null && indexRunning) active.updateLibrary(latest);
+                } catch (Exception ignored) { }
+            }
+        }, "MediatekaLibraryScan");
+        indexThread.setDaemon(true);
+        indexThread.start();
+    }
+
     private void stopServer() {
+        indexRunning = false;
+        if (indexThread != null) indexThread.interrupt();
+        indexThread = null;
         if (server != null) { server.stop(); server = null; }
         serverRunning = false;
         accessCode = "";
@@ -353,6 +411,8 @@ public final class TransferService extends Service {
     }
 
     @Override public void onDestroy() {
+        indexRunning = false;
+        if (indexThread != null) indexThread.interrupt();
         receiverRunning = false;
         if (receiverThread != null) receiverThread.interrupt();
         if (server != null) server.stop();

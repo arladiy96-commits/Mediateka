@@ -15,6 +15,9 @@ import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
 import android.view.View;
+import android.view.MotionEvent;
+import android.view.GestureDetector;
+import android.widget.Toast;
 import android.view.WindowManager;
 import android.text.TextUtils;
 import android.widget.FrameLayout;
@@ -22,7 +25,6 @@ import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.VideoView;
-import android.widget.Toast;
 import android.widget.SeekBar;
 import android.graphics.drawable.GradientDrawable;
 import java.util.Locale;
@@ -36,6 +38,74 @@ import java.net.URLEncoder;
 public final class RemotePlayerActivity extends Activity {
     static final String ACTION_PLAYER = "com.serialtransfer.app.REMOTE_PLAYER";
     static volatile boolean visible;
+    static volatile String playbackId = "";
+    static volatile int playbackPosition;
+    static volatile int playbackDuration;
+    static volatile boolean playbackPlaying;
+    private MediaPlayer preparedPlayer;
+    private GestureDetector gesture;
+    private int lastGoodPosition;
+    private int stalledSeconds;
+    private long bufferingSince;
+    private boolean isBuffering;
+    private boolean manualPause;
+    private boolean retrying;
+    private boolean externalPlayer;
+    private int autoNextDelayMs = 5000;
+    private TextView connectionHint;
+    private boolean lockedControls;
+    private int lastSavedVolume = -1;
+    private final Runnable retryStream = new Runnable() {
+        @Override public void run() {
+            if (!retrying || isFinishing() || currentId.isEmpty()) return;
+            new Thread(() -> {
+                String candidate = MediaLibrary.prefs(RemotePlayerActivity.this)
+                        .getString("remote_host", "");
+                String secret = MediaLibrary.prefs(RemotePlayerActivity.this)
+                        .getString("remote_code", "");
+                String refreshedTicket = "";
+                try {
+                    JSONObject result = new JSONObject(DownloadEngine.list(candidate, secret));
+                    refreshedTicket = result.optString("stream_ticket", "");
+                    MediaLibrary.prefs(RemotePlayerActivity.this).edit()
+                            .putString("remote_cache", result.optJSONArray("files") == null
+                                    ? "[]" : result.optJSONArray("files").toString()).apply();
+                } catch (Exception offline) {
+                    for (String possible : LanDiscovery.find(RemotePlayerActivity.this)) {
+                        try {
+                            JSONObject result = new JSONObject(DownloadEngine.list(possible, secret));
+                            refreshedTicket = result.optString("stream_ticket", "");
+                            candidate = possible;
+                            MediaLibrary.prefs(RemotePlayerActivity.this).edit()
+                                    .putString("remote_host", candidate)
+                                    .putString("remote_cache", result.optJSONArray("files") == null
+                                            ? "[]" : result.optJSONArray("files").toString()).commit();
+                            break;
+                        } catch (Exception denied) { }
+                    }
+                }
+                final String newHost = candidate;
+                final String newTicket = refreshedTicket;
+                uiHandler.post(() -> {
+                    if (!retrying || isFinishing()) return;
+                    if (newTicket.matches("[0-9a-f]{48}")) {
+                        host = newHost;
+                        ticket = newTicket;
+                        retrying = false;
+                        isBuffering = false;
+                        if (connectionHint != null) connectionHint.setVisibility(View.GONE);
+                        restorePosition = Math.max(lastGoodPosition,
+                                WatchHistory.resumeAt(RemotePlayerActivity.this, currentId));
+                        String resumeId = currentId;
+                        currentId = ""; // avoid overwriting saved position when switching URL
+                        playId(resumeId);
+                    } else {
+                        uiHandler.postDelayed(retryStream, 6500);
+                    }
+                });
+            }, "MediatekaStreamReconnect").start();
+        }
+    };
 
     private VideoView video;
     private TextView heading;
@@ -50,12 +120,30 @@ public final class RemotePlayerActivity extends Activity {
             if (video != null && seekBar != null && !scrubbing) {
                 int duration = video.getDuration();
                 int current = video.getCurrentPosition();
+                playbackId = currentId;
+                playbackPosition = Math.max(0, current);
+                playbackDuration = Math.max(0, duration);
+                playbackPlaying = video.isPlaying() && !retrying;
+                if (isBuffering && !retrying && !manualPause && bufferingSince > 0
+                        && android.os.SystemClock.elapsedRealtime() - bufferingSince > 16000) {
+                    startRecovery();
+                }
+                if (video.isPlaying() && current > 0) {
+                    if (current > lastGoodPosition) {
+                        lastGoodPosition = current;
+                        stalledSeconds = 0;
+                    } else if (!retrying && !isBuffering) {
+                        stalledSeconds++;
+                        if (stalledSeconds > 20) startRecovery();
+                    }
+                }
                 if (duration > 0) {
                     seekBar.setProgress((int) Math.min(1000L, Math.max(0L,
                             (long) current * 1000L / duration)));
                     timeTotal.setText(time(duration));
                 }
                 timeElapsed.setText(time(Math.max(0, current)));
+                if (video.isPlaying() && !currentId.isEmpty() && !retrying) savePosition(false);
             }
             uiHandler.postDelayed(this, 900);
         }
@@ -74,6 +162,9 @@ public final class RemotePlayerActivity extends Activity {
     private String host = "";
     private String ticket = "";
     private boolean playing;
+    private boolean completedPlayback;
+    private int restorePosition;
+    private String currentTitle = "Серия";
     private BroadcastReceiver receiver;
 
     @Override public void onCreate(Bundle bundle) {
@@ -82,6 +173,9 @@ public final class RemotePlayerActivity extends Activity {
         getWindow().setNavigationBarColor(Color.BLACK);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         hideSystemBars();
+        autoNextDelayMs = MediaLibrary.prefs(this).getBoolean("auto_next_episode_v7", true) ? 5000 : -1;
+        if (MediaLibrary.prefs(this).getBoolean("remember_volume_v7", false))
+            lastSavedVolume = MediaLibrary.prefs(this).getInt("player_volume_v7", -1);
         build();
         accept(getIntent());
     }
@@ -101,27 +195,96 @@ public final class RemotePlayerActivity extends Activity {
 
         video = new VideoView(this);
         fullScreen.addView(video, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
-        video.setOnClickListener(v -> toggleOverlays());
+        // VideoView uses SurfaceView, which does not reliably dispatch click events.
+        // An invisible tap layer above the video catches touches even after overlays hide.
+        View tapLayer = new View(this);
+        gesture = new GestureDetector(this, new GestureDetector.SimpleOnGestureListener() {
+            @Override public boolean onDown(MotionEvent e) { return true; }
+            @Override public boolean onSingleTapConfirmed(MotionEvent e) {
+                if (!lockedControls) toggleOverlays();
+                else showOverlaysBriefly();
+                return true;
+            }
+            @Override public void onLongPress(MotionEvent e) {
+                if (lockedControls) { lockedControls = false; showOverlaysBriefly(); }
+            }
+            @Override public boolean onDoubleTap(MotionEvent e) {
+                if (lockedControls) return true;
+                if (e.getX() < fullScreen.getWidth() / 2f) seek(-10000);
+                else seek(10000);
+                showOverlaysBriefly();
+                return true;
+            }
+        });
+        tapLayer.setOnTouchListener((v, event) -> {
+            return gesture.onTouchEvent(event);
+        });
+        fullScreen.addView(tapLayer, new FrameLayout.LayoutParams(-1, -1));
         fullScreen.addOnLayoutChangeListener((v, left, top, right, bottom,
                 oldLeft, oldTop, oldRight, oldBottom) -> updateVideoScale());
         video.addOnLayoutChangeListener((v, left, top, right, bottom,
                 oldLeft, oldTop, oldRight, oldBottom) -> updateVideoScale());
         video.setOnPreparedListener(mp -> {
+            preparedPlayer = mp;
+            mp.setOnInfoListener((player, what, extra) -> {
+                if (what == MediaPlayer.MEDIA_INFO_BUFFERING_START) {
+                    isBuffering = true;
+                    bufferingSince = android.os.SystemClock.elapsedRealtime();
+                } else if (what == MediaPlayer.MEDIA_INFO_BUFFERING_END) {
+                    isBuffering = false;
+                    bufferingSince = 0;
+                }
+                return false;
+            });
             mp.setScreenOnWhilePlaying(true);
+            if (lastSavedVolume >= 0 && MediaLibrary.prefs(this)
+                    .getBoolean("remember_volume_v7", false)) {
+                AudioManager audio = (AudioManager) getSystemService(AUDIO_SERVICE);
+                if (audio != null) audio.setStreamVolume(AudioManager.STREAM_MUSIC,
+                        Math.min(lastSavedVolume, audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)), 0);
+            }
             video.start();
+            if (restorePosition > 0) {
+                int duration = video.getDuration();
+                int position = duration > 0 ? Math.min(restorePosition, Math.max(0, duration - 1000))
+                        : restorePosition;
+                video.seekTo(position);
+            }
+            restorePosition = 0;
+            retrying = false;
+            isBuffering = false;
+            manualPause = false;
+            stalledSeconds = 0;
             playing = true;
             setPauseText();
             video.post(() -> updateVideoScale());
             video.postDelayed(() -> updateVideoScale(), 250);
             scheduleOverlaysHide();
         });
-        video.setOnCompletionListener(mp -> step(1));
+        video.setOnCompletionListener(mp -> {
+            savePosition(true);
+            completedPlayback = true;
+            if (autoNextDelayMs > 0 && !isFinishing()) {
+                Toast.makeText(this, "Следующая серия через 5 секунд", Toast.LENGTH_SHORT).show();
+                uiHandler.postDelayed(() -> {
+                    if (completedPlayback && !isFinishing()) step(1);
+                }, autoNextDelayMs);
+            } else {
+                showOverlaysBriefly();
+            }
+        });
         video.setOnErrorListener((mp, what, extra) -> {
+            savePosition(false);
             playing = false;
             setPauseText();
-            setOverlaysVisible(true);
-            Toast.makeText(this, "Плеер не поддерживает формат. Попробуй VLC.",
-                    Toast.LENGTH_LONG).show();
+            if (extra == MediaPlayer.MEDIA_ERROR_IO || extra == MediaPlayer.MEDIA_ERROR_TIMED_OUT
+                    || what == MediaPlayer.MEDIA_ERROR_SERVER_DIED) {
+                startRecovery();
+            } else {
+                setOverlaysVisible(true);
+                Toast.makeText(this, "Неподдерживаемый формат. Попробуй VLC.",
+                        Toast.LENGTH_LONG).show();
+            }
             return true;
         });
 
@@ -149,6 +312,9 @@ public final class RemotePlayerActivity extends Activity {
         fill.setContentDescription("Вписать или заполнить экран");
         zoomButton = fill;
         topOverlay.addView(zoomButton, new LinearLayout.LayoutParams(dp(48), dp(45)));
+        Button tracks = button("☷", () -> trackPicker());
+        tracks.setContentDescription("Аудиодорожки и субтитры");
+        topOverlay.addView(tracks, new LinearLayout.LayoutParams(dp(45), dp(45)));
         fullScreen.addView(topOverlay, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
 
         bottomOverlay = new LinearLayout(this);
@@ -174,6 +340,7 @@ public final class RemotePlayerActivity extends Activity {
                 int duration = video.getDuration();
                 if (duration > 0) video.seekTo((int) ((long) duration * bar.getProgress() / 1000L));
                 scrubbing = false;
+                uiHandler.postDelayed(() -> savePosition(false), 350);
                 showOverlaysBriefly();
             }
         });
@@ -197,7 +364,24 @@ public final class RemotePlayerActivity extends Activity {
         Button external = button("Открыть в VLC", () -> openExternal());
         external.setTextSize(12);
         actions.addView(external, new LinearLayout.LayoutParams(dp(145), dp(37)));
+        Button lock = button("🔒 Блокировка", () -> {
+            lockedControls = !lockedControls;
+            Toast.makeText(this, lockedControls ? "Экран заблокирован. Долгое касание разблокирует"
+                    : "Управление разблокировано", Toast.LENGTH_SHORT).show();
+            if (lockedControls) setOverlaysVisible(false);
+        });
+        actions.addView(lock, new LinearLayout.LayoutParams(dp(165), dp(37)));
         bottomOverlay.addView(actions);
+        connectionHint = new TextView(this);
+        connectionHint.setText("Нет Wi-Fi · ожидание подключения…");
+        connectionHint.setTextSize(13);
+        connectionHint.setTextColor(Color.WHITE);
+        connectionHint.setBackgroundColor(Color.argb(210, 7, 21, 30));
+        connectionHint.setGravity(Gravity.CENTER);
+        connectionHint.setPadding(dp(12), dp(8), dp(12), dp(8));
+        connectionHint.setVisibility(View.GONE);
+        fullScreen.addView(connectionHint, new FrameLayout.LayoutParams(-1, -2, Gravity.CENTER));
+        fullScreen.setOnLongClickListener(v -> { lockedControls = false; showOverlaysBriefly(); return true; });
         fullScreen.addView(bottomOverlay, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
         setContentView(fullScreen);
         showOverlaysBriefly();
@@ -322,11 +506,22 @@ public final class RemotePlayerActivity extends Activity {
                 playId(id);
             } catch (Exception ignored) { }
         } else if ("pause".equals(action)) {
-            if (video.isPlaying()) { video.pause(); playing = false; setPauseText(); }
+            if (video.isPlaying()) {
+                video.pause(); playing = false; manualPause = true;
+                setPauseText(); savePosition(false);
+            }
         } else if ("resume".equals(action)) {
-            if (!currentUrl.isEmpty()) { video.start(); playing = true; setPauseText(); }
+            if (!currentUrl.isEmpty()) {
+                manualPause = false;
+                if (retrying) uiHandler.post(retryStream);
+                else { video.start(); playing = true; }
+                setPauseText();
+            }
         } else if ("stop".equals(action)) {
+            savePosition(false);
             video.stopPlayback(); playing = false; setPauseText(); finish();
+        } else if ("seek_to".equals(action)) {
+            seekAbsolute(command.getIntExtra("remote_ms", 0));
         } else if ("seek_forward".equals(action)) seek(30000);
         else if ("seek_back".equals(action)) seek(-30000);
         else if ("next".equals(action)) step(1);
@@ -335,16 +530,82 @@ public final class RemotePlayerActivity extends Activity {
         else if ("volume_down".equals(action)) changeVolume(false);
     }
 
+    private void startRecovery() {
+        if (retrying || currentId.isEmpty() || manualPause) return;
+        retrying = true;
+        isBuffering = true;
+        playbackPlaying = false;
+        lastGoodPosition = Math.max(lastGoodPosition, video.getCurrentPosition());
+        WatchHistory.save(this, currentId, currentTitle, lastGoodPosition,
+                Math.max(0, video.getDuration()), false);
+        if (connectionHint != null) connectionHint.setVisibility(View.VISIBLE);
+        uiHandler.removeCallbacks(retryStream);
+        uiHandler.postDelayed(retryStream, 1500);
+    }
+
+    private void seekAbsolute(int ms) {
+        if (currentId.isEmpty()) return;
+        int duration = video.getDuration();
+        int target = Math.max(0, ms);
+        if (duration > 0) target = Math.min(target, duration - 1000);
+        video.seekTo(target);
+        lastGoodPosition = target;
+        stalledSeconds = 0;
+        uiHandler.postDelayed(() -> savePosition(false), 400);
+    }
+
+    private void trackPicker() {
+        MediaPlayer media = preparedPlayer;
+        if (media == null) { Toast.makeText(this, "Дорожки ещё не загружены", Toast.LENGTH_SHORT).show(); return; }
+        try {
+            MediaPlayer.TrackInfo[] tracks = media.getTrackInfo();
+            java.util.ArrayList<Integer> indexes = new java.util.ArrayList<>();
+            java.util.ArrayList<String> captions = new java.util.ArrayList<>();
+            for (int i = 0; i < tracks.length; i++) {
+                int type = tracks[i].getTrackType();
+                if (type != MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_AUDIO
+                        && type != MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_SUBTITLE
+                        && type != MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_TIMEDTEXT) continue;
+                indexes.add(i);
+                String lang = tracks[i].getLanguage();
+                captions.add((type == MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_AUDIO ? "Звук" : "Субтитры")
+                        + " · " + (lang == null ? "неизвестно" : lang) + " · " + (i + 1));
+            }
+            if (indexes.isEmpty()) {
+                Toast.makeText(this, "Нет доступных дорожек. Попробуй VLC", Toast.LENGTH_LONG).show();
+                return;
+            }
+            new android.app.AlertDialog.Builder(this).setTitle("Дорожки")
+                    .setItems(captions.toArray(new String[0]), (dialog, which) -> {
+                        try { media.selectTrack(indexes.get(which)); }
+                        catch (Exception e) { Toast.makeText(this,
+                                "Дорожка не поддерживается. Попробуй VLC", Toast.LENGTH_SHORT).show(); }
+                    }).setNegativeButton("Отмена", null).show();
+        } catch (Exception error) {
+            Toast.makeText(this, "Выбор дорожек не поддерживается", Toast.LENGTH_SHORT).show();
+        }
+    }
+
     private void changeVolume(boolean louder) {
         AudioManager audio = (AudioManager) getSystemService(AUDIO_SERVICE);
         if (audio != null) {
             audio.adjustStreamVolume(AudioManager.STREAM_MUSIC,
                     louder ? AudioManager.ADJUST_RAISE : AudioManager.ADJUST_LOWER, 0);
+            lastSavedVolume = audio.getStreamVolume(AudioManager.STREAM_MUSIC);
+            if (MediaLibrary.prefs(this).getBoolean("remember_volume_v7", false))
+                MediaLibrary.prefs(this).edit().putInt("player_volume_v7", lastSavedVolume).apply();
         }
     }
 
     private void playId(String id) {
+        if (!currentId.isEmpty()) savePosition(false);
         currentId = id;
+        playbackId = id;
+        completedPlayback = false;
+        stalledSeconds = 0;
+        lastGoodPosition = Math.max(restorePosition, WatchHistory.resumeAt(this, id));
+        restorePosition = lastGoodPosition;
+        uiHandler.removeCallbacks(retryStream);
         try {
             currentUrl = "http://" + host + ":" + HttpFileServer.PORT + "/stream?id="
                     + URLEncoder.encode(id, "UTF-8") + "&ticket=" + URLEncoder.encode(ticket, "UTF-8");
@@ -356,18 +617,40 @@ public final class RemotePlayerActivity extends Activity {
                     title = obj.optString("name", title); break;
                 }
             }
+            currentTitle = title;
             heading.setText(title);
             video.setScaleX(1f);
             video.setScaleY(1f);
+            if (MediaLibrary.prefs(this).getBoolean("prefer_vlc_v7", false)) {
+                openExternal();
+                return;
+            }
             video.setVideoURI(Uri.parse(currentUrl));
             video.requestFocus();
         } catch (Exception e) { Toast.makeText(this, "Не удалось открыть серию", Toast.LENGTH_SHORT).show(); }
     }
 
     private void toggle() {
-        if (video.isPlaying()) { video.pause(); playing = false; }
-        else if (!currentUrl.isEmpty()) { video.start(); playing = true; }
+        if (video.isPlaying()) {
+            video.pause(); playing = false; manualPause = true; savePosition(false);
+        } else if (!currentUrl.isEmpty()) {
+            manualPause = false; completedPlayback = false;
+            if (retrying) uiHandler.post(retryStream);
+            else { video.start(); playing = true; }
+        }
         setPauseText();
+    }
+
+    private void savePosition(boolean finished) {
+        if (currentId.isEmpty() || (completedPlayback && !finished)) return;
+        try {
+            int position = video.getCurrentPosition();
+            int duration = video.getDuration();
+            if (finished && duration > 0) position = duration;
+            if (retrying && !finished) position = Math.max(position, lastGoodPosition);
+            if (!finished && position <= 0) return;
+            WatchHistory.save(this, currentId, currentTitle, position, duration, finished);
+        } catch (Exception ignored) { }
     }
 
     private void seek(int millis) {
@@ -377,6 +660,7 @@ public final class RemotePlayerActivity extends Activity {
             long target = Math.max(0L, (long) position + millis);
             if (duration > 0) target = Math.min(target, duration - 1L);
             video.seekTo((int)target);
+            uiHandler.postDelayed(() -> savePosition(false), 450);
         } catch (Exception ignored) { }
     }
 
@@ -401,9 +685,17 @@ public final class RemotePlayerActivity extends Activity {
         intent.setDataAndType(Uri.parse(currentUrl), "video/*");
         intent.addCategory(Intent.CATEGORY_DEFAULT);
         try {
+            savePosition(false);
             video.pause();
-            startActivity(Intent.createChooser(intent, "Внешний плеер"));
-            Toast.makeText(this, "Управляй внешним плеером с его экрана", Toast.LENGTH_LONG).show();
+            if (MediaLibrary.prefs(this).getBoolean("prefer_vlc_v7", false)) {
+                Intent vlc = new Intent(intent);
+                vlc.setPackage("org.videolan.vlc");
+                try { startActivity(vlc); }
+                catch (Exception missing) {
+                    startActivity(Intent.createChooser(intent, "Внешний плеер"));
+                }
+            } else startActivity(Intent.createChooser(intent, "Внешний плеер"));
+            Toast.makeText(this, "Внешним плеером управляй на устройстве", Toast.LENGTH_LONG).show();
         } catch (Exception e) { Toast.makeText(this, "Установи VLC", Toast.LENGTH_SHORT).show(); }
     }
 
@@ -421,6 +713,7 @@ public final class RemotePlayerActivity extends Activity {
     }
 
     @Override protected void onPause() {
+        savePosition(false);
         visible = false;
         uiHandler.removeCallbacks(progressUpdate);
         if (receiver != null) { unregisterReceiver(receiver); receiver = null; }
@@ -428,8 +721,13 @@ public final class RemotePlayerActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        savePosition(false);
         uiHandler.removeCallbacksAndMessages(null);
         video.stopPlayback();
+        playbackId = "";
+        playbackPosition = 0;
+        playbackDuration = 0;
+        playbackPlaying = false;
         super.onDestroy();
     }
 }

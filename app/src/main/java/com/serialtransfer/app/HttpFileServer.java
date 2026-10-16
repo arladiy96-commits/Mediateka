@@ -14,6 +14,10 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.net.DatagramSocket;
+import java.net.DatagramPacket;
+import java.net.InetAddress;
+import java.net.SocketTimeoutException;
 import java.net.Socket;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
@@ -36,7 +40,7 @@ final class HttpFileServer {
 
     private final ContentResolver resolver;
     private final Context appContext;
-    private final Map<String, MediaLibrary.Film> byId = new LinkedHashMap<>();
+    private volatile Map<String, MediaLibrary.Film> byId = new LinkedHashMap<>();
     private final ExecutorService clients = Executors.newFixedThreadPool(3);
     private final String code;
     // Streaming tickets change on every server start and do not grant list/download access.
@@ -49,10 +53,53 @@ final class HttpFileServer {
         volatile String name;
         volatile long lastSeen;
         final ArrayDeque<JSONObject> commands = new ArrayDeque<>();
+        volatile String playingId = "";
+        volatile int positionMs;
+        volatile int durationMs;
+        volatile boolean isPlaying;
         Peer(String id, String name) { this.id = id; this.name = name; lastSeen = System.currentTimeMillis(); }
     }
 
     private ServerSocket serverSocket;
+    private DatagramSocket discoverySocket;
+
+    /** Replaces the index atomically without interrupting active streaming or device pairing. */
+    void updateLibrary(List<MediaLibrary.Film> latest) {
+        Map<String, MediaLibrary.Film> replacement = new LinkedHashMap<>();
+        for (MediaLibrary.Film item : latest) replacement.put(item.id, item);
+        byId = replacement;
+    }
+
+    private void startDiscovery() {
+        Thread discovery = new Thread(() -> {
+            try (DatagramSocket socket = new DatagramSocket(null)) {
+                socket.setReuseAddress(true);
+                socket.bind(new InetSocketAddress(LanDiscovery.PORT));
+                socket.setSoTimeout(2000);
+                discoverySocket = socket;
+                byte[] bytes = new byte[96];
+                while (running && !socket.isClosed()) {
+                    DatagramPacket packet = new DatagramPacket(bytes, bytes.length);
+                    try {
+                        socket.receive(packet);
+                        InetAddress sender = packet.getAddress();
+                        if (sender == null || (!sender.isSiteLocalAddress()
+                                && !sender.isLoopbackAddress())) continue;
+                        String query = new String(packet.getData(), packet.getOffset(),
+                                packet.getLength(), StandardCharsets.US_ASCII);
+                        if (!LanDiscovery.REQUEST.equals(query)) continue;
+                        byte[] reply = LanDiscovery.ANSWER.getBytes(StandardCharsets.US_ASCII);
+                        socket.send(new DatagramPacket(reply, reply.length,
+                                sender, packet.getPort()));
+                    } catch (SocketTimeoutException ignored) { }
+                    catch (Exception error) { if (!running) break; }
+                }
+            } catch (Exception ignored) { /* Discovery can be blocked by a router. Manual IP remains. */ }
+        }, "MediatekaLanDiscovery");
+        discovery.setDaemon(true);
+        discovery.start();
+    }
+
 
     HttpFileServer(Context context, List<MediaLibrary.Film> files, String code) {
         appContext = context.getApplicationContext();
@@ -63,7 +110,7 @@ final class HttpFileServer {
         StringBuilder token = new StringBuilder(48);
         for (byte b : random) token.append(String.format(Locale.US, "%02x", b & 255));
         streamTicket = token.toString();
-        for (MediaLibrary.Film file : files) byId.put(file.id, file);
+        updateLibrary(files);
     }
 
     void start() throws Exception {
@@ -72,6 +119,7 @@ final class HttpFileServer {
         socket.bind(new InetSocketAddress(PORT), 8);
         serverSocket = socket;
         running = true;
+        startDiscovery();
         Thread listener = new Thread(new Runnable() {
             @Override public void run() {
                 while (running) {
@@ -92,6 +140,7 @@ final class HttpFileServer {
 
     void stop() {
         running = false;
+        if (discoverySocket != null) discoverySocket.close();
         try { if (serverSocket != null) serverSocket.close(); } catch (Exception ignored) { }
         clients.shutdownNow();
     }
@@ -163,6 +212,18 @@ final class HttpFileServer {
                 }
                 peer.name = name.isEmpty() ? "Android" : name;
                 peer.lastSeen = System.currentTimeMillis();
+                rememberPlayback(id, query);
+                try {
+                    String playerId = queryParam(query, "player_id");
+                    if (playerId.isEmpty() || playerId.matches("[0-9a-f]{24}")) {
+                        peer.playingId = playerId;
+                        peer.positionMs = Math.max(0, Math.min(604800000,
+                                Integer.parseInt(queryParam(query, "player_position"))));
+                        peer.durationMs = Math.max(0, Math.min(604800000,
+                                Integer.parseInt(queryParam(query, "player_duration"))));
+                        peer.isPlaying = "1".equals(queryParam(query, "player_playing"));
+                    }
+                } catch (Exception ignored) { }
                 JSONObject command;
                 synchronized (peer.commands) { command = peer.commands.pollFirst(); }
                 if (command == null) command = new JSONObject().put("action", "none");
@@ -173,7 +234,13 @@ final class HttpFileServer {
                 long now = System.currentTimeMillis();
                 for (Peer peer : peers.values()) {
                     if (now - peer.lastSeen > 30000) continue;
-                    devices.put(new JSONObject().put("id", peer.id).put("name", peer.name));
+                    devices.put(new JSONObject().put("id", peer.id).put("name", peer.name)
+                        .put("player_id", peer.playingId)
+                        .put("position", peer.positionMs)
+                        .put("duration", peer.durationMs)
+                        .put("playing", peer.isPlaying)
+                        .put("player_name", byId.containsKey(peer.playingId)
+                                ? byId.get(peer.playingId).name : ""));
                 }
                 respondJson(out, new JSONObject().put("devices", devices).toString());
             } else if ("/remote/send".equals(path)) {
@@ -188,7 +255,8 @@ final class HttpFileServer {
                 if (!("play".equals(action) || "pause".equals(action) || "resume".equals(action)
                         || "seek_forward".equals(action) || "seek_back".equals(action)
                         || "next".equals(action) || "previous".equals(action) || "stop".equals(action)
-                        || "volume_up".equals(action) || "volume_down".equals(action))) {
+                        || "volume_up".equals(action) || "volume_down".equals(action)
+                        || "seek_to".equals(action))) {
                     respond(out, 400, "Invalid action", head); return;
                 }
                 if ("play".equals(action) && !byId.containsKey(filmId)) {
@@ -197,6 +265,14 @@ final class HttpFileServer {
                 JSONObject command = new JSONObject().put("action", action);
                 if ("play".equals(action)) {
                     command.put("id", filmId).put("ticket", streamTicket);
+                } else if ("seek_to".equals(action)) {
+                    int seek;
+                    try { seek = Integer.parseInt(queryParam(query, "ms")); }
+                    catch (Exception bad) { respond(out, 400, "Invalid seek", head); return; }
+                    if (seek < 0 || seek > 604800000) {
+                        respond(out, 400, "Invalid seek", head); return;
+                    }
+                    command.put("ms", seek);
                 }
                 synchronized (peer.commands) {
                     if (peer.commands.size() >= 15) peer.commands.pollFirst();
@@ -220,6 +296,37 @@ final class HttpFileServer {
                 respond(out, 404, "Not found", head);
             }
         } catch (Exception ignored) { /* Disconnected client, canceled seek or invalid request. */ }
+    }
+
+    private void rememberPlayback(String device, String query) {
+        try {
+            String id = queryParam(query, "watch_id");
+            MediaLibrary.Film film = byId.get(id);
+            if (film == null) return;
+            int position = Integer.parseInt(queryParam(query, "watch_position"));
+            int duration = Integer.parseInt(queryParam(query, "watch_duration"));
+            long updated = Long.parseLong(queryParam(query, "watch_updated"));
+            if (position < 0 || duration < 0 || position > 604800000 || duration > 604800000 || updated <= 0) return;
+            boolean finished = "1".equals(queryParam(query, "watch_finished"));
+            String key = "remote_watch_" + device;
+            JSONObject next = new JSONObject().put("id", id).put("name", film.name)
+                    .put("position", position).put("duration", duration)
+                    .put("finished", finished).put("updated", updated);
+            android.content.SharedPreferences prefs = MediaLibrary.prefs(appContext);
+            String old = prefs.getString(key, "");
+            JSONObject current = null;
+            try { current = new JSONObject(old); } catch (Exception ignored) { }
+            JSONObject previousFile = null;
+            try { previousFile = new JSONObject(prefs.getString(key + "_" + id, "")); }
+            catch (Exception ignored) { }
+            android.content.SharedPreferences.Editor editor = prefs.edit();
+            if (previousFile == null || updated >= previousFile.optLong("updated", 0))
+                editor.putString(key + "_" + id, next.toString());
+            if (current == null || updated >= current.optLong("updated", 0)) {
+                editor.putString(key, next.toString());
+            }
+            editor.apply();
+        } catch (Exception ignored) { /* An old client may not send watch information. */ }
     }
 
     private boolean ticketMatches(String submitted) {
