@@ -1205,7 +1205,7 @@ public final class MainActivity extends Activity {
                                 .putString("selected_remote_device", id)
                                 .putString("selected_remote_name", label).apply();
                     }
-                    LinearLayout device = pocoCard(active);
+                    LinearLayout deviceCard = pocoCard(active);
                     LinearLayout line = row();
                     TextView glyph = pocoText(label.toLowerCase(Locale.ROOT).contains("huawei")
                             || label.toLowerCase(Locale.ROOT).contains("tab") ? "▯" : "▣",
@@ -1219,8 +1219,8 @@ public final class MainActivity extends Activity {
                     title.addView(pocoText("● Онлайн · " + (active ? "Выбран" : "Доступен"),
                             11, false, POCO_CYAN), pocoSpace(6, 0));
                     line.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
-                    device.addView(line);
-                    device.addView(pocoTap(active ? "✓  Активный экран  ·  Пульт" : "▶  Выбрать экран",
+                    deviceCard.addView(line);
+                    deviceCard.addView(pocoTap(active ? "✓  Активный экран  ·  Пульт" : "▶  Выбрать экран",
                             active, v -> {
                                 if (active) { navigate(2); return; }
                                 chosenDevice = id;
@@ -1230,7 +1230,7 @@ public final class MainActivity extends Activity {
                                 nextDevicesAt = 0;
                                 render();
                             }), pocoSpace(9, 0));
-                    targetsPanel.addView(device, pocoSpace(0, 9));
+                    targetsPanel.addView(deviceCard, pocoSpace(0, 9));
                 }
             });
         }, "MediaDevices").start();
