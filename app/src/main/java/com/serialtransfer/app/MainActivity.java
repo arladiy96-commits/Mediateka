@@ -12,6 +12,22 @@ import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.LayerDrawable;
+import android.graphics.RadialGradient;
+import android.graphics.LinearGradient;
+import android.graphics.Canvas;
+import android.graphics.Paint;
+import android.graphics.Shader;
+import android.graphics.RectF;
+import android.view.WindowInsets;
+import android.view.MotionEvent;
+import android.widget.Switch;
+import android.widget.FrameLayout;
+import android.os.StatFs;
+import android.os.Environment;
+import android.text.TextUtils;
 import android.net.DhcpInfo;
 import android.net.Uri;
 import android.content.ActivityNotFoundException;
@@ -65,6 +81,16 @@ public final class MainActivity extends Activity {
     private TextView resumeDetails;
     private Button resumeWatchButton;
     private String chosenDevice = "";
+    private int pocoEpoch;
+    private boolean pocoIsPlaying;
+    private TextView pocoBigPlay;
+    private TextView pocoRemoteName;
+    private final int POCO_BG = Color.rgb(2, 13, 24);
+    private final int POCO_SURFACE = Color.rgb(10, 31, 45);
+    private final int POCO_EDGE = Color.rgb(27, 68, 86);
+    private final int POCO_CYAN = Color.rgb(6, 221, 245);
+    private final int POCO_LIGHT = Color.rgb(235, 249, 255);
+    private final int POCO_MUTED = Color.rgb(132, 163, 184);
     private long nextDevicesAt;
     private volatile boolean refreshingDevices;
     private final ExecutorService actions = Executors.newSingleThreadExecutor();
@@ -114,7 +140,9 @@ public final class MainActivity extends Activity {
             if (linkStatus != null) linkStatus.setText(statusMessage);
             if (compactStatus != null) {
                 boolean active = mode == 0 ? TransferService.serverRunning : linkConnected;
-                compactStatus.setText(active ? "●  Подключено" : "○  Не подключено");
+                compactStatus.setText(mode == 0
+                        ? (active ? "●  Раздача" : "○  Нет раздачи")
+                        : (active ? "●  Подключено" : "○  Не подключено"));
                 compactStatus.setTextColor(active ? ACCENT : MUTED);
             }
             if (pauseButton != null) pauseButton.setVisibility(TransferService.downloading ? View.VISIBLE : View.GONE);
@@ -209,6 +237,7 @@ public final class MainActivity extends Activity {
         remoteNow = null;
         remotePlaying = null;
         episodeChecks.clear();
+        if (mode == 0) { renderPoco(); return; }
 
         LinearLayout screen = column();
         screen.setBackgroundColor(BG);
@@ -412,6 +441,578 @@ public final class MainActivity extends Activity {
         }
     }
 
+
+    // POCO PREMIUM: native UI only.  The viewer module and the network protocol
+    // remain unchanged. No poster decoding, WebView, or third-party UI libraries.
+    private GradientDrawable pocoShape(int first, int second, int radius, int edge) {
+        GradientDrawable drawable = new GradientDrawable(
+                GradientDrawable.Orientation.TL_BR, new int[]{first, second});
+        drawable.setCornerRadius(dp(radius));
+        if (edge != 0) drawable.setStroke(dp(1), edge);
+        return drawable;
+    }
+
+    private void pocoSurface(View target, boolean emphasized, int radius) {
+        target.setBackground(pocoShape(emphasized ? Color.rgb(9, 65, 78) : POCO_SURFACE,
+                emphasized ? Color.rgb(5, 31, 48) : Color.rgb(6, 24, 38),
+                radius, emphasized ? Color.rgb(13, 179, 205) : POCO_EDGE));
+        target.setElevation(dp(emphasized ? 5 : 2));
+    }
+
+    private LinearLayout pocoCard(boolean emphasized) {
+        LinearLayout result = column();
+        result.setPadding(dp(14), dp(14), dp(14), dp(14));
+        pocoSurface(result, emphasized, 16);
+        return result;
+    }
+
+    private TextView pocoText(String value, int size, boolean bold, int color) {
+        TextView label = text(value, size, color, bold);
+        label.setIncludeFontPadding(false);
+        return label;
+    }
+
+    private LinearLayout.LayoutParams pocoSpace(int top, int bottom) {
+        LinearLayout.LayoutParams l = new LinearLayout.LayoutParams(-1, -2);
+        l.topMargin = dp(top); l.bottomMargin = dp(bottom);
+        return l;
+    }
+
+    private TextView pocoTap(String label, boolean bright, View.OnClickListener listener) {
+        TextView view = pocoText(label, 13, true, bright ? POCO_BG : POCO_LIGHT);
+        view.setGravity(Gravity.CENTER);
+        view.setPadding(dp(12), dp(10), dp(12), dp(10));
+        view.setMinHeight(dp(44));
+        GradientDrawable normal = pocoShape(bright ? Color.rgb(11, 215, 239) :
+                        Color.rgb(19, 45, 62), bright ? Color.rgb(12, 173, 204) :
+                        Color.rgb(10, 31, 46), 12,
+                bright ? Color.rgb(72, 240, 251) : POCO_EDGE);
+        view.setBackground(new RippleDrawable(ColorStateList.valueOf(
+                Color.argb(65, 230, 250, 255)), normal, null));
+        view.setOnClickListener(listener);
+        return view;
+    }
+
+    private TextView pocoTapCircle(String value, boolean bright, int size,
+                                   View.OnClickListener listener) {
+        TextView v = pocoText(value, bright ? 29 : 21, true, bright ? POCO_BG : POCO_LIGHT);
+        v.setGravity(Gravity.CENTER);
+        GradientDrawable bg = new GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                bright ? new int[]{POCO_CYAN, Color.rgb(16, 142, 198)}
+                        : new int[]{Color.rgb(23, 57, 75), Color.rgb(11, 33, 48)});
+        bg.setShape(GradientDrawable.OVAL);
+        bg.setStroke(dp(1), bright ? Color.rgb(92, 250, 255) : POCO_EDGE);
+        v.setBackground(new RippleDrawable(ColorStateList.valueOf(0x558CEAFF), bg, null));
+        v.setOnClickListener(listener);
+        v.setElevation(dp(4));
+        v.setLayoutParams(new LinearLayout.LayoutParams(dp(size), dp(size)));
+        return v;
+    }
+
+    private void pocoAddHeading(String label, String action, View.OnClickListener onClick) {
+        LinearLayout line = row();
+        TextView heading = pocoText(label, 17, true, POCO_LIGHT);
+        line.addView(heading, new LinearLayout.LayoutParams(0, -2, 1));
+        if (action != null) {
+            TextView link = pocoText(action + "  ›", 12, true, POCO_CYAN);
+            link.setPadding(dp(6), dp(9), dp(2), dp(9));
+            link.setOnClickListener(onClick);
+            line.addView(link);
+        }
+        content.addView(line, pocoSpace(19, 10));
+    }
+
+    private void pocoInfoRow(LinearLayout parent, String symbol, String label,
+                             String description, String tail, View.OnClickListener callback) {
+        LinearLayout body = row();
+        body.setPadding(dp(10), dp(10), dp(10), dp(10));
+        LinearLayout iconBg = column();
+        iconBg.setGravity(Gravity.CENTER);
+        iconBg.setBackground(pocoShape(Color.rgb(13, 62, 81), Color.rgb(9, 37, 54), 10, POCO_EDGE));
+        TextView icon = pocoText(symbol, 22, true, POCO_CYAN);
+        icon.setGravity(Gravity.CENTER);
+        iconBg.addView(icon);
+        body.addView(iconBg, new LinearLayout.LayoutParams(dp(41), dp(43)));
+        LinearLayout details = column();
+        details.setPadding(dp(11), dp(1), dp(4), 0);
+        TextView title = pocoText(label, 13, true, POCO_LIGHT);
+        title.setSingleLine(true); title.setEllipsize(TextUtils.TruncateAt.END);
+        details.addView(title);
+        if (description != null && !description.isEmpty()) {
+            TextView second = pocoText(description, 11, false, POCO_MUTED);
+            second.setSingleLine(true); second.setEllipsize(TextUtils.TruncateAt.END);
+            details.addView(second, pocoSpace(5, 0));
+        }
+        body.addView(details, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView arrow = pocoText(tail, 18, false, POCO_CYAN);
+        arrow.setGravity(Gravity.CENTER);
+        body.addView(arrow);
+        if (callback != null) {
+            body.setOnClickListener(callback);
+            body.setBackground(new RippleDrawable(ColorStateList.valueOf(0x3656CDDD),
+                    pocoShape(Color.TRANSPARENT, Color.TRANSPARENT, 10, 0), null));
+        }
+        parent.addView(body);
+    }
+
+    private void pocoSeparator(LinearLayout parent) {
+        View line = new View(this);
+        line.setBackgroundColor(Color.rgb(22, 49, 65));
+        parent.addView(line, new LinearLayout.LayoutParams(-1, dp(1)));
+    }
+
+    private void renderPoco() {
+        pocoEpoch++;
+        pocoBigPlay = null;
+        pocoRemoteName = null;
+        resumeCard = null; resumeDetails = null; resumeWatchButton = null;
+        hostInfo = null; targetsPanel = null; remotePlaying = null;
+        remoteNow = null; remoteSeek = null; compactStatus = null;
+        LinearLayout screen = column();
+        screen.setBackground(pocoShape(POCO_BG, Color.rgb(3, 17, 30), 0, 0));
+        screen.setFitsSystemWindows(true);
+        LinearLayout top = row();
+        top.setPadding(dp(19), dp(14), dp(19), dp(13));
+        TextView logo = pocoText("▷", 36, true, POCO_CYAN);
+        logo.setGravity(Gravity.CENTER_VERTICAL);
+        top.addView(logo, new LinearLayout.LayoutParams(dp(43), dp(48)));
+        LinearLayout caption = column();
+        caption.addView(pocoText("Медиатека", 21, true, POCO_LIGHT));
+        caption.addView(pocoText("БИБЛИОТЕКА POCO", 10, true, POCO_MUTED), pocoSpace(4, 0));
+        top.addView(caption, new LinearLayout.LayoutParams(0, -2, 1));
+        compactStatus = pocoText("●  Проверка", 11, true, POCO_MUTED);
+        compactStatus.setGravity(Gravity.CENTER_VERTICAL);
+        compactStatus.setOnClickListener(v -> navigate(3));
+        top.addView(compactStatus);
+        screen.addView(top);
+        View headerEdge = new View(this);
+        headerEdge.setBackground(new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
+                new int[]{0x000FC5DF, 0xAA0FC5DF, 0x000FC5DF}));
+        screen.addView(headerEdge, new LinearLayout.LayoutParams(-1, dp(1)));
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true); scroll.setVerticalScrollBarEnabled(false);
+        content = column();
+        content.setPadding(dp(16), dp(17), dp(16), dp(28));
+        scroll.addView(content);
+        screen.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        if (page == 0) pocoHome();
+        else if (page == 1) pocoDevices();
+        else if (page == 2) pocoRemote();
+        else if (page == 3) pocoFiles();
+        else pocoSettings();
+        pocoBottomNav(screen);
+        setContentView(screen);
+        if (TransferService.serverRunning && targetsPanel != null) refreshRemoteDevices();
+    }
+
+    private void pocoBottomNav(LinearLayout root) {
+        String[] names = {"Главная", "Устройства", "Пульт", "Файлы", "Настройки"};
+        String[] icons = {"⌂", "▣", "◉", "▤", "⚙"};
+        LinearLayout nav = row();
+        nav.setPadding(dp(7), dp(7), dp(7), dp(5));
+        nav.setBackground(pocoShape(0xFF081E2C, 0xFF041422, 0, 0));
+        for (int i=0; i<names.length; i++) {
+            final int target=i;
+            LinearLayout tile=column();
+            tile.setGravity(Gravity.CENTER);
+            if(page==i) tile.setBackground(pocoShape(0xFF064257, 0xFF082B3D, 11, 0));
+            TextView glyph=pocoText(icons[i], 22, page==i, page==i?POCO_CYAN:POCO_MUTED);
+            glyph.setGravity(Gravity.CENTER);
+            tile.addView(glyph);
+            TextView text=pocoText(names[i], 9, page==i, page==i?POCO_CYAN:POCO_MUTED);
+            text.setGravity(Gravity.CENTER);
+            tile.addView(text, pocoSpace(4,0));
+            tile.setOnClickListener(v -> navigate(target));
+            nav.addView(tile, new LinearLayout.LayoutParams(0, dp(58), 1));
+        }
+        root.addView(nav);
+    }
+
+    private String pocoDeviceName() {
+        if (chosenDevice.isEmpty()) return "Экран не выбран";
+        return MediaLibrary.prefs(this).getString("selected_remote_name", "Подключённый экран");
+    }
+
+    private void pocoHome() {
+        content.addView(pocoText("Продолжить просмотр", 19, true, POCO_LIGHT), pocoSpace(1, 11));
+        resumeCard = pocoCard(true);
+        resumeCard.addView(pocoText("ПОСЛЕДНИЙ ПРОСМОТР", 10, true, POCO_CYAN));
+        resumeDetails = pocoText("Синхронизирую историю просмотра…", 13, false, POCO_LIGHT);
+        resumeCard.addView(resumeDetails, pocoSpace(10, 8));
+        resumeWatchButton = button("▶   Продолжить на экране", true);
+        resumeWatchButton.setBackground(pocoShape(POCO_CYAN, Color.rgb(13, 162, 186), 12, 0));
+        resumeCard.addView(resumeWatchButton, pocoSpace(5, 0));
+        resumeWatchButton.setOnClickListener(v -> {
+            if (chosenDevice.isEmpty()) { navigate(1); return; }
+            try {
+                JSONObject history = new JSONObject(MediaLibrary.prefs(this)
+                        .getString("remote_watch_" + chosenDevice, ""));
+                String id=history.optString("id", "");
+                if (id.matches("[0-9a-f]{24}")) sendToRemote("play", id);
+                else toast("Пока нет сохранённого просмотра");
+            } catch (Exception e) { toast("Пока нет сохранённого просмотра"); }
+        });
+        content.addView(resumeCard, pocoSpace(0, 13));
+        updateResumeCard();
+        LinearLayout chosenCard=pocoCard(false);
+        chosenCard.addView(pocoText("АКТИВНЫЙ ЭКРАН", 10, true, POCO_CYAN));
+        pocoInfoRow(chosenCard, "▣", pocoDeviceName(),
+                chosenDevice.isEmpty()?"Выбери устройство для просмотра":"Пульт и воспроизведение",
+                "›", v -> navigate(1));
+        content.addView(chosenCard, pocoSpace(0, 6));
+        pocoAddHeading("Быстрый доступ", null, null);
+        LinearLayout shortcuts=row();
+        String[] labels={"Сериалы","Устройства","Файлы"};
+        String[] glyphs={"▤","▣","⇩"};
+        int[] pages={3,1,3};
+        for(int i=0;i<3;i++) {
+            final int destination=pages[i];
+            LinearLayout tile=pocoCard(false);
+            tile.setGravity(Gravity.CENTER);
+            TextView g=pocoText(glyphs[i], 25, true, POCO_CYAN); g.setGravity(Gravity.CENTER);
+            tile.addView(g);
+            tile.addView(pocoText(labels[i], 11, true, POCO_LIGHT), pocoSpace(9, 0));
+            tile.setOnClickListener(v -> navigate(destination));
+            LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(0, dp(90), 1);
+            if (i>0) lp.leftMargin=dp(7);
+            shortcuts.addView(tile, lp);
+        }
+        content.addView(shortcuts);
+        pocoAddHeading("Мои сериалы", "Все", v -> navigate(3));
+        LinearLayout preview=pocoCard(false);
+        preview.addView(pocoText("Загружаю библиотеку…", 12, false, POCO_MUTED));
+        content.addView(preview);
+        pocoLoadCollections(preview, 5, true, pocoEpoch);
+        TextView add=pocoTap("＋   Добавить сериалы", false, v -> sourceFolderPicker());
+        content.addView(add, pocoSpace(12, 0));
+    }
+
+    private void pocoDevices() {
+        pocoPageIntro("Устройства", "Подключай экраны и управляй просмотром");
+        LinearLayout tip=pocoCard(true);
+        tip.addView(pocoText("◉   ВЫБРАННЫЙ ЭКРАН", 11, true, POCO_CYAN));
+        tip.addView(pocoText(pocoDeviceName(), 19, true, POCO_LIGHT), pocoSpace(11, 4));
+        tip.addView(pocoText(chosenDevice.isEmpty()?"Выбери экран из списка ниже":
+                "Управление и запуск серий доступны на вкладке «Пульт»",
+                12, false, POCO_MUTED));
+        if (!chosenDevice.isEmpty()) {
+            tip.addView(pocoTap("▶   Открыть пульт", true, v -> navigate(2)), pocoSpace(13, 0));
+        }
+        content.addView(tip, pocoSpace(0, 12));
+        pocoAddHeading("Доступные устройства", "Обновить", v -> refreshRemoteDevices());
+        targetsPanel=column();
+        targetsPanel.addView(pocoText("Поиск экранов в локальной сети…", 13, false, POCO_MUTED));
+        content.addView(targetsPanel);
+        LinearLayout hint=pocoCard(false);
+        hint.addView(pocoText("КАК ПОДКЛЮЧИТЬ", 10, true, POCO_CYAN));
+        hint.addView(pocoText("Установи «Медиатека — Экран» на Huawei или ТВ. " +
+                "Один раз подключи его к POCO по коду из раздела «Файлы». " +
+                "Когда экран появится в списке, выбери его.", 12, false, POCO_MUTED), pocoSpace(8,0));
+        content.addView(hint, pocoSpace(16,0));
+        content.addView(pocoTap("Показать код подключения", false, v -> navigate(3)), pocoSpace(10,0));
+    }
+
+    private void pocoRemote() {
+        pocoPageIntro("Пульт", "Дистанционное воспроизведение");
+        targetsPanel=column(); // refresh state without needing a second network listener
+        LinearLayout selected=pocoCard(false);
+        selected.addView(pocoText("УСТРОЙСТВО ВОСПРОИЗВЕДЕНИЯ", 10, true, POCO_CYAN));
+        LinearLayout sr=row();
+        pocoRemoteName=pocoText(pocoDeviceName(), 16, true, POCO_LIGHT);
+        sr.addView(pocoRemoteName,new LinearLayout.LayoutParams(0, -2, 1));
+        sr.addView(pocoTap("Изменить  ›", false, v -> navigate(1)),
+                new LinearLayout.LayoutParams(dp(119), dp(44)));
+        selected.addView(sr,pocoSpace(10,0));
+        content.addView(selected);
+        LinearLayout playback=pocoCard(true);
+        FrameLayout hero=new FrameLayout(this);
+        hero.addView(new PocoWave(this));
+        LinearLayout title=column();
+        title.setGravity(Gravity.BOTTOM);
+        title.setPadding(dp(13),dp(38),dp(13),dp(18));
+        title.addView(pocoText("СЕЙЧАС ВОСПРОИЗВОДИТСЯ", 10, true, POCO_CYAN));
+        remotePlaying=pocoText("Ожидание запуска серии", 18, true, POCO_LIGHT);
+        remotePlaying.setMaxLines(2); remotePlaying.setEllipsize(TextUtils.TruncateAt.END);
+        title.addView(remotePlaying,pocoSpace(9,0));
+        hero.addView(title,new FrameLayout.LayoutParams(-1,-1));
+        playback.addView(hero,new LinearLayout.LayoutParams(-1,dp(140)));
+        remoteNow=pocoText("00:00 / 00:00", 12, false, POCO_MUTED);
+        remoteNow.setGravity(Gravity.RIGHT);
+        playback.addView(remoteNow,pocoSpace(10,4));
+        remoteSeek=new SeekBar(this);
+        remoteSeek.setMax(1000);
+        remoteSeek.setProgressTintList(ColorStateList.valueOf(POCO_CYAN));
+        remoteSeek.setThumbTintList(ColorStateList.valueOf(POCO_CYAN));
+        remoteSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onStartTrackingTouch(SeekBar bar) {}
+            @Override public void onProgressChanged(SeekBar bar,int value,boolean byUser) {}
+            @Override public void onStopTrackingTouch(SeekBar bar) {
+                int duration=MediaLibrary.prefs(MainActivity.this)
+                        .getInt("remote_duration_v7_"+chosenDevice,0);
+                if(duration>0) seekRemote((int)((long)bar.getProgress()*duration/1000L));
+            }
+        });
+        playback.addView(remoteSeek);
+        LinearLayout controls=row(); controls.setGravity(Gravity.CENTER);
+        controls.addView(pocoTapCircle("↶",false,60,v -> sendToRemote("seek_back","")));
+        pocoBigPlay=pocoTapCircle("▶",true,85,v -> {
+            sendToRemote(pocoIsPlaying?"pause":"resume","");
+        });
+        LinearLayout.LayoutParams center=new LinearLayout.LayoutParams(dp(85),dp(85));
+        center.leftMargin=dp(21); center.rightMargin=dp(21);
+        controls.addView(pocoBigPlay,center);
+        controls.addView(pocoTapCircle("↷",false,60,v -> sendToRemote("seek_forward","")));
+        playback.addView(controls,pocoSpace(8,12));
+        LinearLayout skip=row();
+        TextView prev=pocoTap("|◀  Предыдущая",false,v -> sendToRemote("previous",""));
+        TextView next=pocoTap("Следующая  ▶|",false,v -> sendToRemote("next",""));
+        skip.addView(prev,new LinearLayout.LayoutParams(0,dp(46),1));
+        LinearLayout.LayoutParams nlp=new LinearLayout.LayoutParams(0,dp(46),1);
+        nlp.leftMargin=dp(8); skip.addView(next,nlp);
+        playback.addView(skip);
+        content.addView(playback,pocoSpace(13,0));
+        pocoAddHeading("Управление",null,null);
+        LinearLayout volume=pocoCard(false);
+        volume.addView(pocoText("ЗВУК НА УСТРОЙСТВЕ",10,true,POCO_MUTED));
+        LinearLayout volRow=row();
+        volRow.addView(pocoTap("−  Тише",false,v -> sendToRemote("volume_down","")),
+                new LinearLayout.LayoutParams(0,dp(45),1));
+        LinearLayout.LayoutParams rp=new LinearLayout.LayoutParams(0,dp(45),1); rp.leftMargin=dp(8);
+        volRow.addView(pocoTap("＋  Громче",false,v -> sendToRemote("volume_up","")),rp);
+        volume.addView(volRow,pocoSpace(10,0));
+        content.addView(volume);
+        content.addView(pocoTap("▤   Выбрать серию",true,v -> navigate(0)),pocoSpace(13,0));
+        content.addView(pocoTap("■   Остановить просмотр",false,v -> sendToRemote("stop","")),pocoSpace(8,0));
+    }
+
+    private void pocoFiles() {
+        if (!openCollection.isEmpty()) {
+            pocoPageIntro(openCollection,"Серии · нажми ▶ для запуска на выбранном экране");
+            content.addView(pocoTap("‹   Ко всем сериалам",false,v -> {openCollection="";render();}),pocoSpace(0,10));
+            LinearLayout rows=pocoCard(false);
+            rows.addView(pocoText("Обновляю список…",12,false,POCO_MUTED));
+            content.addView(rows);
+            pocoLoadCollections(rows, 600, false, pocoEpoch);
+            return;
+        }
+        pocoPageIntro("Файлы", "Библиотека на телефоне");
+        LinearLayout server=pocoCard(true);
+        server.addView(pocoText("СЕРВЕР МЕДИАТЕКИ",10,true,POCO_CYAN));
+        hostInfo=pocoText("Проверяю локальную сеть…",13,true,POCO_LIGHT);
+        server.addView(hostInfo,pocoSpace(9,7));
+        LinearLayout actions=row();
+        actions.addView(pocoTap("▶  Включить",true,v -> {
+            MediaLibrary.prefs(this).edit().putBoolean("auto_share",true).apply();
+            TransferService.send(this,TransferService.START_SERVER);
+        }),new LinearLayout.LayoutParams(0,dp(43),1));
+        LinearLayout.LayoutParams off=new LinearLayout.LayoutParams(0,dp(43),1);
+        off.leftMargin=dp(8);
+        actions.addView(pocoTap("■  Выключить",false,v -> {
+            MediaLibrary.prefs(this).edit().putBoolean("auto_share",false).apply();
+            TransferService.send(this,TransferService.STOP_SERVER);
+        }),off);
+        server.addView(actions,pocoSpace(5,0));
+        content.addView(server);
+        content.addView(pocoTap("▱   Выбрать папку с сериалами",true,v -> sourceFolderPicker()),pocoSpace(13,7));
+        content.addView(pocoTap("＋   Добавить отдельные видео",false,v -> sourceFilesPicker()));
+        pocoStorage();
+        pocoAddHeading("Библиотека", "Обновить", v -> render());
+        LinearLayout collection=pocoCard(false);
+        collection.addView(pocoText("Читаю список…",12,false,POCO_MUTED));
+        content.addView(collection);
+        pocoLoadCollections(collection, 600, true, pocoEpoch);
+        TextView clear=pocoText("Очистить список библиотеки",12,false,POCO_MUTED);
+        clear.setPadding(dp(9),dp(14),dp(9),dp(14));
+        clear.setOnClickListener(v -> new AlertDialog.Builder(this)
+                .setTitle("Убрать файлы из библиотеки?")
+                .setMessage("Исходные фильмы на POCO не удаляются.")
+                .setNegativeButton("Отмена",null)
+                .setPositiveButton("Убрать",(dialog,which) -> {
+                    MediaLibrary.clearSources(this);
+                    TransferService.send(this,TransferService.STOP_SERVER);
+                    render();
+                }).show());
+        content.addView(clear,pocoSpace(5,0));
+    }
+
+    private void pocoStorage() {
+        try {
+            StatFs stats=new StatFs(Environment.getDataDirectory().getAbsolutePath());
+            long total=stats.getTotalBytes(); long free=stats.getAvailableBytes();
+            LinearLayout storage=pocoCard(false);
+            storage.addView(pocoText("ПАМЯТЬ ТЕЛЕФОНА",10,true,POCO_CYAN));
+            storage.addView(pocoText(MediaLibrary.readableSize(free)+" свободно из "+
+                    MediaLibrary.readableSize(total),12,false,POCO_MUTED),pocoSpace(8,8));
+            View track=new View(this);
+            GradientDrawable fill=pocoShape(Color.rgb(5,184,202),Color.rgb(8,86,123),6,0);
+            track.setBackground(fill);
+            LinearLayout line=row();
+            line.setBackground(pocoShape(0xFF13293A,0xFF13293A,5,0));
+            LinearLayout.LayoutParams width=new LinearLayout.LayoutParams(0,dp(5),
+                    Math.max(0.01f,(float)(total-free)/Math.max(total,1)));
+            line.addView(track,width);
+            line.addView(new View(this),new LinearLayout.LayoutParams(0,dp(5),
+                    Math.max(0.01f,(float)free/Math.max(total,1))));
+            storage.addView(line);
+            content.addView(storage,pocoSpace(13,0));
+        } catch (Exception ignored) { }
+    }
+
+    private void pocoSettings() {
+        pocoPageIntro("Настройки", "Подключение · Воспроизведение · Библиотека");
+        pocoAddHeading("Подключение",null,null);
+        LinearLayout net=pocoCard(false);
+        pocoSwitch(net,"Раздавать при запуске","Если в библиотеке есть фильмы",
+                "auto_share",true);
+        pocoSeparator(net);
+        pocoInfoRow(net,"◎","Данные подключения","Показать IP и код раздачи","›",v -> navigate(3));
+        content.addView(net);
+        pocoAddHeading("Воспроизведение",null,null);
+        LinearLayout playback=pocoCard(false);
+        playback.addView(pocoText("УПРАВЛЕНИЕ НА POCO", 10, true, POCO_CYAN));
+        playback.addView(pocoText("Запуск серии, пауза, перемотка, звук и выбор экрана "
+                + "доступны в разделе «Пульт». Настройки самого плеера (автоследующая "
+                + "серия, VLC и сохранение громкости) пока задаются на устройстве «Экран».",
+                12, false, POCO_MUTED), pocoSpace(9, 0));
+        playback.addView(pocoTap("◉   Открыть пульт", false, v -> navigate(2)),
+                pocoSpace(11, 0));
+        content.addView(playback);
+        pocoAddHeading("Файлы и библиотека",null,null);
+        LinearLayout files=pocoCard(false);
+        pocoInfoRow(files,"▱","Папка с сериалами","Выбрать другую папку","›",v -> sourceFolderPicker());
+        pocoSeparator(files);
+        pocoInfoRow(files,"◌","Обновить библиотеку","Перечитать доступные серии","›",v -> {
+            navigate(3);
+        });
+        content.addView(files);
+        pocoAddHeading("Диагностика",null,null);
+        LinearLayout tools=pocoCard(false);
+        pocoInfoRow(tools,"⌁","Проверка локальной сети","Поиск устройств и диагностика Wi-Fi","›",
+                v -> diagnoseNetwork());
+        pocoSeparator(tools);
+        pocoInfoRow(tools,"▤","История просмотра","Продолжить просмотр — на Главной","›",v -> navigate(0));
+        content.addView(tools);
+        content.addView(pocoText("Медиатека · POCO · Нативный Android",11,false,POCO_MUTED),
+                pocoSpace(24,0));
+    }
+
+    private void pocoSwitch(LinearLayout parent,String name,String subtitle,
+                             String preference,boolean defaultValue) {
+        LinearLayout line=row(); line.setPadding(dp(9),dp(12),dp(6),dp(12));
+        LinearLayout labels=column();
+        labels.addView(pocoText(name,13,true,POCO_LIGHT));
+        labels.addView(pocoText(subtitle,11,false,POCO_MUTED),pocoSpace(4,0));
+        line.addView(labels,new LinearLayout.LayoutParams(0,-2,1));
+        Switch toggle=new Switch(this);
+        toggle.setShowText(false);
+        toggle.setThumbTintList(ColorStateList.valueOf(POCO_CYAN));
+        toggle.setTrackTintList(ColorStateList.valueOf(0xFF236578));
+        toggle.setChecked(MediaLibrary.prefs(this).getBoolean(preference,defaultValue));
+        toggle.setOnCheckedChangeListener((button, enabled) -> {
+            MediaLibrary.prefs(this).edit().putBoolean(preference,enabled).apply();
+            if ("auto_share".equals(preference)) {
+                TransferService.send(this,enabled ? TransferService.START_SERVER : TransferService.STOP_SERVER);
+            }
+        });
+        line.addView(toggle);
+        parent.addView(line);
+    }
+
+    private void pocoPageIntro(String title,String subtitle) {
+        content.addView(pocoText(title,25,true,POCO_LIGHT),pocoSpace(3,6));
+        content.addView(pocoText(subtitle,12,false,POCO_MUTED),pocoSpace(0,16));
+    }
+
+    private void pocoLoadCollections(final LinearLayout destination,final int limit,
+                                     final boolean groupsOnly,final int version) {
+        new Thread(() -> {
+            final List<MediaLibrary.Film> all=MediaLibrary.scan(this);
+            runOnUiThread(() -> {
+                if(disposed || version!=pocoEpoch) return;
+                destination.removeAllViews();
+                if(all.isEmpty()) {
+                    destination.addView(pocoText("В библиотеке пока нет серий. Выбери папку с видео.",
+                            13,false,POCO_MUTED));
+                    return;
+                }
+                if(groupsOnly || openCollection.isEmpty()) {
+                    java.util.LinkedHashMap<String,Integer> groups=new java.util.LinkedHashMap<>();
+                    for(MediaLibrary.Film item:all) {
+                        String key=collectionName(item.name);
+                        groups.put(key,groups.containsKey(key)?groups.get(key)+1:1);
+                    }
+                    int shown=0;
+                    for(java.util.Map.Entry<String,Integer> group:groups.entrySet()) {
+                        if(shown++>=limit) break;
+                        final String key=group.getKey();
+                        if(shown>1) pocoSeparator(destination);
+                        pocoInfoRow(destination,"▱",key,group.getValue()+" серий",
+                                "›",v -> {page=3;openCollection=key;render();});
+                    }
+                    if(groups.size()>limit) destination.addView(pocoTap("Показать все сериалы",false,
+                            v -> navigate(3)),pocoSpace(9,0));
+                } else {
+                    int shown=0;
+                    for(MediaLibrary.Film episode:all) {
+                        if(!openCollection.equals(collectionName(episode.name))) continue;
+                        if(shown++>=limit) break;
+                        if(shown>1) pocoSeparator(destination);
+                        LinearLayout row=row();row.setPadding(dp(8),dp(10),dp(4),dp(10));
+                        LinearLayout details=column();
+                        TextView name=pocoText(cleanFilename(episode.name),13,true,POCO_LIGHT);
+                        name.setMaxLines(2);
+                        details.addView(name);
+                        String detail=MediaLibrary.readableSize(episode.size);
+                        if(!chosenDevice.isEmpty()) {
+                            try {
+                                JSONObject watch=new JSONObject(MediaLibrary.prefs(this)
+                                        .getString("remote_watch_"+chosenDevice+"_"+episode.id,""));
+                                if(watch.optBoolean("finished")) detail+=" · Просмотрено ✓";
+                                else if(watch.optInt("position")>5000) detail+=" · "+
+                                        clock(watch.optInt("position"));
+                            } catch(Exception ignored) {}
+                        }
+                        details.addView(pocoText(detail,11,false,POCO_MUTED),pocoSpace(5,0));
+                        row.addView(details,new LinearLayout.LayoutParams(0,-2,1));
+                        TextView play=pocoTap("▶",true,v -> sendToRemote("play",episode.id));
+                        row.addView(play,new LinearLayout.LayoutParams(dp(48),dp(44)));
+                        destination.addView(row);
+                    }
+                    if(shown>limit) destination.addView(pocoTap("Показать ещё",false,v -> {
+                        pocoLoadCollections(destination,limit+80,false,pocoEpoch);
+                    }),pocoSpace(9,0));
+                }
+            });
+        },"PocoLibraryUi").start();
+    }
+
+    /** Precomputed vector-light waves; no bitmap allocation or continuous animation. */
+    private static final class PocoWave extends View {
+        private final Paint brush=new Paint(Paint.ANTI_ALIAS_FLAG);
+        PocoWave(Context context) {super(context);}
+        @Override protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            float w=getWidth(),h=getHeight();
+            if(w<=0||h<=0)return;
+            brush.setShader(new LinearGradient(0,0,w,h,
+                    new int[]{0xFF071E30,0xFF0C3D57,0xFF051522},null,Shader.TileMode.CLAMP));
+            canvas.drawRoundRect(new RectF(0,0,w,h),15,15,brush);
+            brush.setShader(null);
+            brush.setStyle(Paint.Style.STROKE);
+            for(int strand=0;strand<5;strand++) {
+                android.graphics.Path path=new android.graphics.Path();
+                float shift=strand*7f;
+                path.moveTo(-10,h*.62f+shift);
+                path.cubicTo(w*.27f,h*.09f+shift,w*.47f,h*.95f+shift,w+.5f,h*.26f+shift);
+                brush.setColor(strand==0?0xAA21EBF6:0x2236BBDD);
+                brush.setStrokeWidth(strand==0?2.2f:1.1f);
+                canvas.drawPath(path,brush);
+            }
+            brush.setStyle(Paint.Style.FILL);
+        }
+    }
+
     private void showSender() {
         if (page == 1) {
             pageTitle("Устройства", "Выбери экран для удалённого просмотра");
@@ -559,6 +1160,8 @@ public final class MainActivity extends Activity {
         int duration = state.optInt("duration", 0);
         boolean playing = state.optBoolean("playing", false);
         MediaLibrary.prefs(this).edit().putInt("remote_duration_v7_" + chosenDevice, duration).apply();
+        pocoIsPlaying = playing;
+        if (pocoBigPlay != null) pocoBigPlay.setText(playing ? "Ⅱ" : "▶");
         if (remotePlaying != null) {
             String name = "Нет активного просмотра";
             if (id.matches("[0-9a-f]{24}")) {
@@ -598,23 +1201,36 @@ public final class MainActivity extends Activity {
                     if (active) updateRemoteProgress(device);
                     if (chosenDevice.isEmpty() && found.length() == 1) {
                         chosenDevice = id;
-                        MediaLibrary.prefs(this).edit().putString("selected_remote_device", id).apply();
+                        MediaLibrary.prefs(this).edit()
+                                .putString("selected_remote_device", id)
+                                .putString("selected_remote_name", label).apply();
                     }
+                    LinearLayout device = pocoCard(active);
                     LinearLayout line = row();
+                    TextView glyph = pocoText(label.toLowerCase(Locale.ROOT).contains("huawei")
+                            || label.toLowerCase(Locale.ROOT).contains("tab") ? "▯" : "▣",
+                            26, true, POCO_CYAN);
+                    glyph.setGravity(Gravity.CENTER);
+                    line.addView(glyph, new LinearLayout.LayoutParams(dp(43), dp(51)));
                     LinearLayout title = column();
-                    title.addView(text((active ? "● " : "○ ") + label, 14, active ? ACCENT : WHITE, true));
-                    title.addView(text(active ? "Выбран для воспроизведения" : "Доступен по локальному Wi-Fi",
-                            11, MUTED, false), spaced(4, 0));
+                    TextView name = pocoText(label, 15, true, POCO_LIGHT);
+                    name.setSingleLine(true); name.setEllipsize(TextUtils.TruncateAt.END);
+                    title.addView(name);
+                    title.addView(pocoText("● Онлайн · " + (active ? "Выбран" : "Доступен"),
+                            11, false, POCO_CYAN), pocoSpace(6, 0));
                     line.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
-                    Button choose = button(active ? "✓" : "Выбрать", active);
-                    line.addView(choose, new LinearLayout.LayoutParams(dp(92), dp(44)));
-                    choose.setOnClickListener(v -> {
-                        chosenDevice = id;
-                        MediaLibrary.prefs(this).edit().putString("selected_remote_device", id).apply();
-                        nextDevicesAt = 0;
-                        render();
-                    });
-                    targetsPanel.addView(line, spaced(0, 9));
+                    device.addView(line);
+                    device.addView(pocoTap(active ? "✓  Активный экран  ·  Пульт" : "▶  Выбрать экран",
+                            active, v -> {
+                                if (active) { navigate(2); return; }
+                                chosenDevice = id;
+                                MediaLibrary.prefs(this).edit()
+                                        .putString("selected_remote_device", id)
+                                        .putString("selected_remote_name", label).apply();
+                                nextDevicesAt = 0;
+                                render();
+                            }), pocoSpace(9, 0));
+                    targetsPanel.addView(device, pocoSpace(0, 9));
                 }
             });
         }, "MediaDevices").start();
