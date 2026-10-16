@@ -1,4 +1,4 @@
-name: Build APK
+name: Build POCO APK
 
 # Manual only: no push, pull_request or release triggers.
 on:
@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: serialtransfer-release
+  group: mediateka-app-release
   cancel-in-progress: false
 
 jobs:
@@ -46,12 +46,12 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/serialtransfer-release.jks
+          ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/mediateka-release.jks
         run: |
           set -euo pipefail
 
           if [[ ! -x ./gradlew ]]; then
-            echo "::error::Gradle Wrapper missing. Run Bootstrap Android first."
+            echo "::error::Gradle Wrapper missing. Existing Gradle Wrapper not found."
             exit 1
           fi
 
@@ -80,15 +80,15 @@ jobs:
       - name: Build installable APK
         shell: bash
         env:
-          ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/serialtransfer-release.jks
+          ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/mediateka-release.jks
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           if [[ '${{ steps.signing.outputs.mode }}' == 'release' ]]; then
-            ./gradlew --no-daemon --stacktrace assembleRelease -PbuildNumber=${{ github.run_number }}
+            ./gradlew --no-daemon --stacktrace :app:assembleRelease -PbuildNumber=${{ github.run_number }}
           else
-            ./gradlew --no-daemon --stacktrace assembleDebug -PbuildNumber=${{ github.run_number }}
+            ./gradlew --no-daemon --stacktrace :app:assembleDebug -PbuildNumber=${{ github.run_number }}
           fi
 
       - name: Publish APK directly to GitHub Releases
@@ -98,26 +98,26 @@ jobs:
         run: |
           set -euo pipefail
           MODE='${{ steps.signing.outputs.mode }}'
-          TAG="v0.1.${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          TAG="poco-v8.${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
           mkdir -p dist
 
           if [[ "$MODE" == "release" ]]; then
             SOURCE_APK='app/build/outputs/apk/release/app-release.apk'
-            RELEASE_NOTES='Android APK signed with the repository release key. Installable on Android 7+.'
+            RELEASE_NOTES='Android APK signed with the repository release key. Installable on Android 7+. Only manual Run workflow.'
             EXTRA=()
           else
             SOURCE_APK='app/build/outputs/apk/debug/app-debug.apk'
-            RELEASE_NOTES='Test build (debug-signed). Installable on Android 7+. For in-place updates without data loss, configure a permanent release signing key.'
+            RELEASE_NOTES='Test build (debug-signed). Installable on Android 7+. Only manual Run workflow. For in-place updates without data loss, configure a permanent release signing key.'
             EXTRA=(--prerelease)
           fi
 
           [[ -s "$SOURCE_APK" ]] || { echo "::error::APK missing: $SOURCE_APK"; exit 1; }
-          cp "$SOURCE_APK" dist/SerialTransfer.apk
-          sha256sum dist/SerialTransfer.apk
+          cp "$SOURCE_APK" dist/Mediateka-POCO.apk
+          sha256sum dist/Mediateka-POCO.apk
 
-          gh release create "$TAG" dist/SerialTransfer.apk \
+          gh release create "$TAG" dist/Mediateka-POCO.apk \
             --target "$GITHUB_SHA" \
-            --title "SerialTransfer $TAG" \
+            --title "Медиатека · POCO $TAG" \
             --notes "$RELEASE_NOTES" \
             "${EXTRA[@]}"
 
@@ -125,6 +125,6 @@ jobs:
             echo "### APK published to GitHub Releases"
             echo "- Tag: $TAG"
             echo "- Signing mode: $MODE"
-            echo "- APK asset: SerialTransfer.apk"
+            echo "- APK asset: Mediateka-POCO.apk"
             echo "- Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
           } >> "$GITHUB_STEP_SUMMARY"
