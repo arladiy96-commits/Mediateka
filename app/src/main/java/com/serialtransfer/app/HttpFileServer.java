@@ -20,6 +20,10 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.LinkedHashMap;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -38,6 +42,16 @@ final class HttpFileServer {
     // Streaming tickets change on every server start and do not grant list/download access.
     private final String streamTicket;
     private volatile boolean running;
+    private final Map<String, Peer> peers = new ConcurrentHashMap<>();
+
+    private static final class Peer {
+        final String id;
+        volatile String name;
+        volatile long lastSeen;
+        final ArrayDeque<JSONObject> commands = new ArrayDeque<>();
+        Peer(String id, String name) { this.id = id; this.name = name; lastSeen = System.currentTimeMillis(); }
+    }
+
     private ServerSocket serverSocket;
 
     HttpFileServer(Context context, List<MediaLibrary.Film> files, String code) {
@@ -132,7 +146,64 @@ final class HttpFileServer {
                 respond(out, 403, "Wrong pairing code", head);
                 return;
             }
-            if ("/list".equals(path)) {
+            if ("/remote/poll".equals(path)) {
+                if (head) { respond(out, 405, "GET only", head); return; }
+                String id = queryParam(query, "device");
+                String name = queryParam(query, "name");
+                if (!id.matches("[A-Za-z0-9_-]{8,64}")) {
+                    respond(out, 400, "Invalid device", head); return;
+                }
+                if (name.length() > 40) name = name.substring(0, 40);
+                Peer peer = peers.get(id);
+                if (peer == null) {
+                    if (peers.size() >= 20) { respond(out, 429, "Too many devices", head); return; }
+                    Peer created = new Peer(id, name);
+                    Peer previous = peers.putIfAbsent(id, created);
+                    peer = previous == null ? created : previous;
+                }
+                peer.name = name.isEmpty() ? "Android" : name;
+                peer.lastSeen = System.currentTimeMillis();
+                JSONObject command;
+                synchronized (peer.commands) { command = peer.commands.pollFirst(); }
+                if (command == null) command = new JSONObject().put("action", "none");
+                respondJson(out, command.toString());
+            } else if ("/remote/devices".equals(path)) {
+                if (head) { respond(out, 405, "GET only", head); return; }
+                JSONArray devices = new JSONArray();
+                long now = System.currentTimeMillis();
+                for (Peer peer : peers.values()) {
+                    if (now - peer.lastSeen > 30000) continue;
+                    devices.put(new JSONObject().put("id", peer.id).put("name", peer.name));
+                }
+                respondJson(out, new JSONObject().put("devices", devices).toString());
+            } else if ("/remote/send".equals(path)) {
+                if (head) { respond(out, 405, "GET only", head); return; }
+                String device = queryParam(query, "device");
+                String action = queryParam(query, "action");
+                String filmId = queryParam(query, "id");
+                Peer peer = peers.get(device);
+                if (peer == null || System.currentTimeMillis() - peer.lastSeen > 30000) {
+                    respond(out, 404, "Device offline", head); return;
+                }
+                if (!("play".equals(action) || "pause".equals(action) || "resume".equals(action)
+                        || "seek_forward".equals(action) || "seek_back".equals(action)
+                        || "next".equals(action) || "previous".equals(action) || "stop".equals(action)
+                        || "volume_up".equals(action) || "volume_down".equals(action))) {
+                    respond(out, 400, "Invalid action", head); return;
+                }
+                if ("play".equals(action) && !byId.containsKey(filmId)) {
+                    respond(out, 404, "File missing", head); return;
+                }
+                JSONObject command = new JSONObject().put("action", action);
+                if ("play".equals(action)) {
+                    command.put("id", filmId).put("ticket", streamTicket);
+                }
+                synchronized (peer.commands) {
+                    if (peer.commands.size() >= 15) peer.commands.pollFirst();
+                    peer.commands.addLast(command);
+                }
+                respondJson(out, new JSONObject().put("ok", true).toString());
+            } else if ("/list".equals(path)) {
                 if (head) { respond(out, 405, "GET only", true); return; }
                 JSONObject data = new JSONObject();
                 data.put("protocol", 2);

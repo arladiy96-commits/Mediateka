@@ -40,9 +40,12 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /** Low-memory native interface, compatible with Android 7. Pair once and reconnect later. */
 public final class MainActivity extends Activity {
+    static volatile boolean uiVisible;
     private static final int PICK_FILES = 101;
     private static final int PICK_SOURCE_FOLDER = 102;
     private static final int PICK_SD_FOLDER = 103;
@@ -54,6 +57,13 @@ public final class MainActivity extends Activity {
     private static final int MUTED = Color.rgb(154, 171, 177);
 
     private LinearLayout content;
+    private LinearLayout targetsPanel;
+    private LinearLayout remoteLibraryPanel;
+    private TextView remoteMessage;
+    private String chosenDevice = "";
+    private long nextDevicesAt;
+    private volatile boolean refreshingDevices;
+    private final ExecutorService actions = Executors.newSingleThreadExecutor();
     private TextView hostInfo;
     private TextView linkStatus;
     private TextView transferStatus;
@@ -109,6 +119,11 @@ public final class MainActivity extends Activity {
                 nextReconnectAt = now + 45000;
                 connectSaved(true);
             }
+            if (mode == 0 && TransferService.serverRunning && targetsPanel != null
+                    && now >= nextDevicesAt && !refreshingDevices) {
+                nextDevicesAt = now + 9000;
+                refreshRemoteDevices();
+            }
             handler.postDelayed(this, 900);
         }
     };
@@ -119,29 +134,46 @@ public final class MainActivity extends Activity {
         getWindow().setNavigationBarColor(BG);
         SharedPreferences prefs = MediaLibrary.prefs(this);
         mode = prefs.getInt("screen", 0);
+        chosenDevice = prefs.getString("selected_remote_device", "");
         try { remoteFiles = new JSONArray(prefs.getString("remote_cache", "[]")); }
         catch (Exception ignored) { remoteFiles = new JSONArray(); }
         render();
         handler.post(ticker);
         if (mode == 0) startSenderIfRemembered();
-        else handler.postDelayed(new Runnable() {
+        else {
+            startReceiverIfPaired();
+            handler.postDelayed(new Runnable() {
             @Override public void run() { connectSaved(true); }
         }, 450);
+        }
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
                 != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{ Manifest.permission.POST_NOTIFICATIONS }, 77);
         }
     }
 
+    @Override protected void onResume() {
+        super.onResume();
+        uiVisible = true;
+    }
+    @Override protected void onPause() {
+        uiVisible = false;
+        super.onPause();
+    }
+
     @Override protected void onDestroy() {
         disposed = true;
         handler.removeCallbacksAndMessages(null);
+        actions.shutdownNow();
         super.onDestroy();
     }
 
     private void render() {
         seenQueueRevision = TransferService.queueRevision;
         hostInfo = null;
+        targetsPanel = null;
+        remoteLibraryPanel = null;
+        remoteMessage = null;
         linkStatus = null;
         transferStatus = null;
         downloadButton = null;
@@ -196,8 +228,13 @@ public final class MainActivity extends Activity {
         streamTicket = "";
         MediaLibrary.prefs(this).edit().putInt("screen", mode).apply();
         render();
-        if (mode == 0) startSenderIfRemembered();
-        else connectSaved(true);
+        if (mode == 0) {
+            TransferService.send(this, TransferService.STOP_RECEIVER);
+            startSenderIfRemembered();
+        } else {
+            startReceiverIfPaired();
+            connectSaved(true);
+        }
     }
 
     private void showSender() {
@@ -220,6 +257,30 @@ public final class MainActivity extends Activity {
                     }
                 });
         note("Код постоянный: после первого подключения Huawei запомнит телефон.");
+
+        sectionTitle("На каком экране смотреть", "Huawei, приставка и магнитола появятся после подключения к этому POCO.");
+        targetsPanel = panel();
+        targetsPanel.addView(text("Ищу устройства...", 13, MUTED, false));
+        content.addView(targetsPanel, spaced(0, 8));
+        action("Обновить список экранов", false, new View.OnClickListener() {
+            @Override public void onClick(View v) { refreshRemoteDevices(); }
+        });
+        sectionTitle("Управлять просмотром", "Сначала выбери экран, затем серию ниже.");
+        rowActions("Пауза", "Продолжить", v -> sendToRemote("pause", ""),
+                v -> sendToRemote("resume", ""));
+        rowActions("−30 секунд", "+30 секунд", v -> sendToRemote("seek_back", ""),
+                v -> sendToRemote("seek_forward", ""));
+        rowActions("Предыдущая", "Следующая", v -> sendToRemote("previous", ""),
+                v -> sendToRemote("next", ""));
+        rowActions("Тише", "Громче", v -> sendToRemote("volume_down", ""),
+                v -> sendToRemote("volume_up", ""));
+        link("Остановить просмотр", v -> sendToRemote("stop", ""));
+        sectionTitle("Запустить серию на экране", "Нажми ▶ рядом с серией — она откроется на выбранном устройстве.");
+        remoteLibraryPanel = panel();
+        remoteLibraryPanel.addView(text("Загружаю список...", 13, MUTED, false));
+        content.addView(remoteLibraryPanel, spaced(0, 12));
+        scanSenderEpisodes();
+        refreshRemoteDevices();
 
         sectionTitle("Твои серии", "Можно добавить отдельные файлы или всю папку с сезонами.");
         LinearLayout library = panel();
@@ -261,6 +322,107 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private void startReceiverIfPaired() {
+        SharedPreferences prefs = MediaLibrary.prefs(this);
+        if (!prefs.getString("remote_host", "").isEmpty()
+                && prefs.getString("remote_code", "").matches("[0-9]{8}")) {
+            TransferService.send(this, TransferService.START_RECEIVER);
+        }
+    }
+
+    private void refreshRemoteDevices() {
+        if (refreshingDevices || !TransferService.serverRunning || targetsPanel == null) return;
+        refreshingDevices = true;
+        new Thread(new Runnable() {
+            @Override public void run() {
+                JSONArray devices = new JSONArray();
+                try { devices = RemoteControlClient.devices(TransferService.accessCode); }
+                catch (Exception ignored) { }
+                final JSONArray found = devices;
+                runOnUiThread(new Runnable() {
+                    @Override public void run() {
+                        refreshingDevices = false;
+                        if (disposed || mode != 0 || targetsPanel == null) return;
+                        targetsPanel.removeAllViews();
+                        if (found.length() == 0) {
+                            targetsPanel.addView(text("Устройств пока нет. Открой Медиатеку на Huawei и подключи его к POCO.",
+                                    13, MUTED, false));
+                            return;
+                        }
+                        for (int i = 0; i < found.length(); i++) {
+                            JSONObject device = found.optJSONObject(i);
+                            if (device == null) continue;
+                            String id = device.optString("id", "");
+                            String label = device.optString("name", "Android");
+                            boolean active = chosenDevice.equals(id);
+                            LinearLayout row = row();
+                            row.addView(text((active ? "● " : "○ ") + label, 13,
+                                    active ? ACCENT : WHITE, true), new LinearLayout.LayoutParams(0, -2, 1));
+                            Button choose = button(active ? "Выбран" : "Выбрать", active);
+                            row.addView(choose, new LinearLayout.LayoutParams(dp(104), dp(43)));
+                            choose.setOnClickListener(v -> {
+                                chosenDevice = id;
+                                MediaLibrary.prefs(MainActivity.this).edit()
+                                        .putString("selected_remote_device", id).apply();
+                                nextDevicesAt = 0;
+                                render();
+                            });
+                            targetsPanel.addView(row);
+                        }
+                    }
+                });
+            }
+        }, "RemoteScreensRefresh").start();
+    }
+
+    private void scanSenderEpisodes() {
+        new Thread(new Runnable() {
+            @Override public void run() {
+                final List<MediaLibrary.Film> available = MediaLibrary.scan(MainActivity.this);
+                runOnUiThread(new Runnable() {
+                    @Override public void run() {
+                        if (disposed || mode != 0 || remoteLibraryPanel == null) return;
+                        remoteLibraryPanel.removeAllViews();
+                        if (available.size() == 0) {
+                            remoteLibraryPanel.addView(text("Сначала добавь папку или серию.", 13, MUTED, false));
+                            return;
+                        }
+                        for (MediaLibrary.Film film : available) {
+                            LinearLayout line = row();
+                            TextView name = text(film.name, 13, WHITE, false);
+                            name.setMaxLines(2);
+                            line.addView(name, new LinearLayout.LayoutParams(0, -2, 1));
+                            Button play = button("▶", true);
+                            line.addView(play, new LinearLayout.LayoutParams(dp(51), dp(46)));
+                            play.setOnClickListener(v -> sendToRemote("play", film.id));
+                            remoteLibraryPanel.addView(line, spaced(0, 4));
+                        }
+                    }
+                });
+            }
+        }, "SenderEpisodeButtons").start();
+    }
+
+    private void sendToRemote(final String action, final String fileId) {
+        final String target = chosenDevice;
+        final String code = TransferService.accessCode;
+        if (target.isEmpty()) { toast("Сначала выбери устройство для просмотра"); return; }
+        if (!TransferService.serverRunning) { toast("Сначала включи раздачу на POCO"); return; }
+        actions.execute(new Runnable() {
+            @Override public void run() {
+                String message;
+                try {
+                    RemoteControlClient.send(code, target, action, fileId);
+                    message = "Команда отправлена";
+                } catch (Exception e) {
+                    message = "Не удалось связаться с экраном: " + e.getMessage();
+                }
+                final String result = message;
+                runOnUiThread(() -> { if (!disposed) toast(result); });
+            }
+        });
+    }
+
     private void scanLocal(final TextView count, final TextView preview) {
         new Thread(new Runnable() {
             @Override public void run() {
@@ -296,6 +458,8 @@ public final class MainActivity extends Activity {
         SharedPreferences prefs = MediaLibrary.prefs(this);
         String host = prefs.getString("remote_host", "");
         boolean remembered = !host.isEmpty() && prefs.getString("remote_code", "").matches("[0-9]{8}");
+        sectionTitle("Удалённое управление", "POCO может запускать серии и управлять плеером на этом устройстве.");
+        note("Чтобы POCO видел этот экран, оставь фоновую службу Медиатеки включённой.");
         sectionTitle("Телефон", remembered ? "Подключение сохранено — повторный ввод не нужен." :
                 "Первый раз введи IP и код с экрана телефона.");
         LinearLayout connection = panel();
@@ -513,6 +677,7 @@ public final class MainActivity extends Activity {
                     dialog.dismiss();
                     statusMessage = "Подключаюсь...";
                     render();
+                    startReceiverIfPaired();
                     connectSaved(false);
                 }));
         dialog.show();

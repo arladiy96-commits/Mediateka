@@ -13,6 +13,8 @@ import android.os.IBinder;
 import android.os.PowerManager;
 
 import org.json.JSONArray;
+import org.json.JSONObject;
+import android.app.TaskStackBuilder;
 
 import java.net.Inet4Address;
 import java.net.NetworkInterface;
@@ -31,6 +33,11 @@ public final class TransferService extends Service {
     static final String STOP_SERVER = "stop_server";
     static final String DOWNLOAD = "download";
     static final String PAUSE = "pause";
+    static final String START_RECEIVER = "start_receiver";
+    static final String STOP_RECEIVER = "stop_receiver";
+    private volatile boolean receiverRunning;
+    private Thread receiverThread;
+
     static final int NOTICE_ID = 71;
     static final String CHANNEL_ID = "mediateka_transfer";
 
@@ -67,7 +74,88 @@ public final class TransferService extends Service {
         else if (STOP_SERVER.equals(command)) stopServer();
         else if (DOWNLOAD.equals(command)) startDownload(intent);
         else if (PAUSE.equals(command)) pauseDownload();
+        else if (START_RECEIVER.equals(command)) startReceiver();
+        else if (STOP_RECEIVER.equals(command)) stopReceiver();
         return START_NOT_STICKY;
+    }
+
+    /** Receiver polls the phone; no inbound sockets or new pairing necessary. */
+    private synchronized void startReceiver() {
+        if (receiverRunning) return;
+        receiverRunning = true;
+        receiverThread = new Thread(new Runnable() {
+            @Override public void run() {
+                while (receiverRunning) {
+                    try {
+                        android.content.SharedPreferences prefs = MediaLibrary.prefs(TransferService.this);
+                        String host = prefs.getString("remote_host", "");
+                        String code = prefs.getString("remote_code", "");
+                        if (!host.isEmpty() && code.matches("[0-9]{8}")) {
+                            JSONObject command = RemoteControlClient.poll(TransferService.this, host, code);
+                            if (receiverRunning && !"none".equals(command.optString("action", "none"))) {
+                                if ("play".equals(command.optString("action"))) {
+                                    try {
+                                        JSONObject library = new JSONObject(DownloadEngine.list(host, code));
+                                        MediaLibrary.prefs(TransferService.this).edit()
+                                                .putString("remote_cache", library.getJSONArray("files").toString()).apply();
+                                    } catch (Exception ignored) { }
+                                }
+                                handleRemoteCommand(command);
+                            }
+                        }
+                    } catch (Exception ignored) { /* retry after Wi-Fi is restored */ }
+                    try { Thread.sleep(2500); } catch (InterruptedException interrupted) { break; }
+                }
+            }
+        }, "RemotePlayerPoll");
+        receiverThread.start();
+        notice("Готов к управлению с POCO");
+    }
+
+    private synchronized void stopReceiver() {
+        receiverRunning = false;
+        if (receiverThread != null) receiverThread.interrupt();
+        receiverThread = null;
+        stopIfIdle();
+    }
+
+    private void handleRemoteCommand(JSONObject command) {
+        String action = command.optString("action", "");
+        Intent player = new Intent(this, RemotePlayerActivity.class)
+                .putExtra("remote_action", action)
+                .putExtra("remote_id", command.optString("id", ""))
+                .putExtra("remote_ticket", command.optString("ticket", ""));
+        player.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP
+                | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        if (RemotePlayerActivity.visible) {
+            Intent message = new Intent(RemotePlayerActivity.ACTION_PLAYER);
+            message.setPackage(getPackageName());
+            message.putExtras(player);
+            sendBroadcast(message);
+        } else if ("play".equals(action)) {
+            if (Build.VERSION.SDK_INT < 29 || MainActivity.uiVisible) {
+                try { startActivity(player); return; }
+                catch (Exception ignored) { }
+            }
+            // Android 10+ restricts launching an Activity from the background.
+            // A notification is the supported fallback when the app is not visible.
+            PendingIntent tap = PendingIntent.getActivity(this, 88, player,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            if (Build.VERSION.SDK_INT >= 26) {
+                NotificationChannel controlChannel = new NotificationChannel("mediateka_remote_actions",
+                        "Запуск видео с телефона", NotificationManager.IMPORTANCE_DEFAULT);
+                ((NotificationManager) getSystemService(NOTIFICATION_SERVICE))
+                        .createNotificationChannel(controlChannel);
+            }
+            Notification.Builder alert = Build.VERSION.SDK_INT >= 26
+                    ? new Notification.Builder(this, "mediateka_remote_actions") : new Notification.Builder(this);
+            alert.setSmallIcon(android.R.drawable.ic_media_play)
+                    .setContentTitle("Сериал выбран на POCO")
+                    .setContentText("Нажми, чтобы смотреть на этом устройстве")
+                    .setContentIntent(tap).setAutoCancel(true);
+            if (Build.VERSION.SDK_INT < 26) alert.setPriority(Notification.PRIORITY_HIGH);
+            ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).notify(72, alert.build());
+        }
     }
 
     private void startServer() {
@@ -194,7 +282,7 @@ public final class TransferService extends Service {
     }
 
     private void stopIfIdle() {
-        if (!serverRunning && !downloading) stopSelf();
+        if (!serverRunning && !downloading && !receiverRunning) stopSelf();
     }
 
     private void ensureChannel() {
@@ -216,7 +304,7 @@ public final class TransferService extends Service {
                 .setContentTitle("Медиатека")
                 .setContentText(content)
                 .setContentIntent(tap)
-                .setOngoing(serverRunning || downloading);
+                .setOngoing(serverRunning || downloading || receiverRunning);
         if (Build.VERSION.SDK_INT < 26) builder.setPriority(Notification.PRIORITY_LOW);
         return builder.build();
     }
@@ -265,6 +353,8 @@ public final class TransferService extends Service {
     }
 
     @Override public void onDestroy() {
+        receiverRunning = false;
+        if (receiverThread != null) receiverThread.interrupt();
         if (server != null) server.stop();
         if (engine != null) engine.interrupt();
         serverRunning = false;
