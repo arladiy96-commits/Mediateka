@@ -12,19 +12,21 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.DocumentsContract;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
-import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
+
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -32,291 +34,646 @@ import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/** Small viewer/controller companion. No sharing server, artwork or WebView. */
+/**
+ * Mediateka Screen: lightweight receiver-only UI for Android 7 / 1GB RAM.
+ * The video stream, remote protocol and download engine are unchanged.
+ * No artwork, WebView, local server, animation or heavy dependency.
+ */
 public final class MainActivity extends Activity {
     static volatile boolean uiVisible;
-    private static final int BG = Color.rgb(7, 17, 26), PANEL = Color.rgb(17, 34, 45);
-    private static final int TEXT = Color.rgb(235, 247, 251), MUTED = Color.rgb(142, 165, 179);
-    private static final int ACCENT = Color.rgb(33, 196, 219), LINE = Color.rgb(33, 57, 72);
+
+    private static final int BG = Color.rgb(5, 15, 24);
+    private static final int PANEL = Color.rgb(13, 32, 44);
+    private static final int PANEL_LIGHT = Color.rgb(20, 46, 59);
+    private static final int TEXT = Color.rgb(239, 249, 251);
+    private static final int MUTED = Color.rgb(146, 170, 184);
+    private static final int CYAN = Color.rgb(48, 198, 219);
+    private static final int BORDER = Color.rgb(35, 69, 84);
     private static final int PICK_SD = 33;
+
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ExecutorService network = Executors.newSingleThreadExecutor();
-    private volatile boolean closed, connecting, connected;
-    private int page = 0, queueSeen = -1, visibleCount = 45;
-    private String status = "Не подключено";
-    private JSONArray files = new JSONArray();
-    private String ticket = "";
-    private LinearLayout body;
-    private TextView stateLine, progressLine;
     private final Set<String> selected = new HashSet<>();
+
+    private volatile boolean closed, connecting, connected;
+    private String status = "Не подключено";
+    private String ticket = "";
+    private JSONArray files = new JSONArray();
+    private int page = 0;                 // 0 watch, 1 downloads
+    private int filter = 0;               // 0 all, 1 downloaded, 2 missing
+    private int visibleCount = 36;
+    private int lastQueueRevision = -1;
+    private long lastConnectAttempt;
+    private LinearLayout body;
+    private TextView connectionIndicator, progressIndicator, selectionIndicator;
+
     private final Runnable ticker = new Runnable() {
         @Override public void run() {
             if (closed) return;
-            if (stateLine != null) stateLine.setText(status);
-            if (progressLine != null) progressLine.setText(TransferService.progressText);
-            if (queueSeen != TransferService.queueRevision && page == 1) {
-                queueSeen = TransferService.queueRevision; draw();
+            if (connectionIndicator != null) {
+                connectionIndicator.setText(connected ? "● POCO" : "○ POCO");
+                connectionIndicator.setTextColor(connected ? CYAN : MUTED);
             }
-            handler.postDelayed(this, 1400);
+            if (progressIndicator != null) progressIndicator.setText(TransferService.progressText);
+            if (page == 1 && lastQueueRevision != TransferService.queueRevision) {
+                lastQueueRevision = TransferService.queueRevision;
+                draw();
+            }
+            if (!connected && paired() && !connecting && uiVisible
+                    && SystemClock.elapsedRealtime() - lastConnectAttempt > 25000) connect();
+            handler.postDelayed(this, 1500);
         }
     };
-    @Override public void onCreate(Bundle saved) {
-        super.onCreate(saved);
+
+    @Override public void onCreate(Bundle state) {
+        super.onCreate(state);
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
-        try { files = new JSONArray(prefs().getString("remote_cache", "[]")); } catch (Exception ignored) { }
-        draw(); handler.post(ticker);
-        if (paired()) { TransferService.send(this, TransferService.START_RECEIVER); connect(); }
+        try { files = new JSONArray(prefs().getString("remote_cache", "[]")); }
+        catch (Exception ignored) { }
+        draw();
+        handler.post(ticker);
+        if (paired()) {
+            TransferService.send(this, TransferService.START_RECEIVER);
+            connect();
+        }
     }
-    @Override protected void onResume() { super.onResume(); uiVisible = true; }
-    @Override protected void onPause() { uiVisible = false; super.onPause(); }
+
+    @Override protected void onResume() {
+        super.onResume();
+        uiVisible = true;
+        // A completed episode may have changed its bookmark while this Activity was hidden.
+        if (body != null && !closed) draw();
+    }
+
+    @Override protected void onPause() {
+        uiVisible = false;
+        super.onPause();
+    }
+
     @Override protected void onDestroy() {
         closed = true;
         handler.removeCallbacksAndMessages(null);
         network.shutdownNow();
         super.onDestroy();
     }
+
     private SharedPreferences prefs() { return MediaLibrary.prefs(this); }
     private boolean paired() { return prefs().getString("remote_code", "").matches("[0-9]{8}"); }
-    private int dp(int n) { return (int)(getResources().getDisplayMetrics().density * n + .5f); }
-    private GradientDrawable panel() {
-        GradientDrawable d = new GradientDrawable(); d.setColor(PANEL); d.setCornerRadius(dp(13));
-        d.setStroke(dp(1), LINE); return d;
+    private int dp(float n) { return (int) (getResources().getDisplayMetrics().density * n + .5f); }
+
+    private GradientDrawable shape(int color, int border, int radius) {
+        GradientDrawable d = new GradientDrawable();
+        d.setColor(color);
+        d.setCornerRadius(dp(radius));
+        if (border != 0) d.setStroke(dp(1), border);
+        return d;
     }
-    private TextView text(String s,int size,int color,boolean bold) {
-        TextView t = new TextView(this); t.setText(s); t.setTextColor(color); t.setTextSize(size);
-        if (bold) t.setTypeface(Typeface.DEFAULT, Typeface.BOLD); return t;
+
+    private TextView text(String value, int size, int color, boolean bold) {
+        TextView t = new TextView(this);
+        t.setText(value);
+        t.setTextColor(color);
+        t.setTextSize(size);
+        if (bold) t.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        return t;
     }
-    private LinearLayout col() { LinearLayout b = new LinearLayout(this); b.setOrientation(1); return b; }
-    private LinearLayout row() { LinearLayout b = new LinearLayout(this); b.setOrientation(0); b.setGravity(Gravity.CENTER_VERTICAL); return b; }
-    private LinearLayout.LayoutParams margins(int top,int bottom) {
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1,-2);
-        p.setMargins(0,dp(top),0,dp(bottom)); return p;
+
+    private LinearLayout vertical() {
+        LinearLayout l = new LinearLayout(this);
+        l.setOrientation(LinearLayout.VERTICAL);
+        return l;
     }
-    private Button button(String title,Runnable click) {
-        Button b = new Button(this); b.setAllCaps(false); b.setText(title); b.setTextColor(TEXT);
-        b.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(19, 65, 81)));
-        b.setTextSize(13); b.setOnClickListener(v -> click.run()); return b;
+
+    private LinearLayout horizontal() {
+        LinearLayout l = new LinearLayout(this);
+        l.setOrientation(LinearLayout.HORIZONTAL);
+        l.setGravity(Gravity.CENTER_VERTICAL);
+        return l;
     }
-    private void action(String title,Runnable click) { body.addView(button(title,click),margins(3,5)); }
-    private void title(String title,String subtitle) {
-        body.addView(text(title,22,TEXT,true),margins(8,3));
-        body.addView(text(subtitle,12,MUTED,false),margins(0,12));
+
+    private LinearLayout.LayoutParams spaced(int top, int bottom) {
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2);
+        p.setMargins(0, dp(top), 0, dp(bottom));
+        return p;
     }
-    private void card(String title,String detail) {
-        LinearLayout box = col(); box.setPadding(dp(14),dp(13),dp(12),dp(13)); box.setBackground(panel());
-        box.addView(text(title,14,TEXT,true)); box.addView(text(detail,12,MUTED,false),margins(5,0));
-        body.addView(box,margins(0,10));
+
+    private TextView button(String value, boolean primary, Runnable onTap) {
+        TextView b = text(value, 13, primary ? BG : TEXT, primary);
+        b.setGravity(Gravity.CENTER);
+        b.setMinHeight(dp(44));
+        b.setPadding(dp(10), dp(9), dp(10), dp(9));
+        b.setBackground(shape(primary ? CYAN : PANEL_LIGHT,
+                primary ? 0 : BORDER, 10));
+        b.setClickable(true);
+        b.setOnClickListener(v -> onTap.run());
+        return b;
     }
+
+    private TextView link(String label, Runnable onTap) {
+        TextView v = text(label, 12, CYAN, true);
+        v.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
+        v.setPadding(dp(9), dp(10), 0, dp(10));
+        v.setOnClickListener(w -> onTap.run());
+        return v;
+    }
+
+    private LinearLayout card(int padding) {
+        LinearLayout c = vertical();
+        c.setPadding(dp(padding), dp(padding), dp(padding), dp(padding));
+        c.setBackground(shape(PANEL, BORDER, 12));
+        return c;
+    }
+
+    private void heading(String heading, String description) {
+        body.addView(text(heading, 18, TEXT, true), spaced(5, 3));
+        if (description != null && !description.isEmpty())
+            body.addView(text(description, 12, MUTED, false), spaced(0, 10));
+    }
+
     private void draw() {
-        LinearLayout base = col(); base.setBackgroundColor(BG);
-        LinearLayout top = row(); top.setPadding(dp(18),dp(16),dp(14),dp(12));
-        LinearLayout cap = col(); cap.addView(text("▷  Медиатека",21,TEXT,true));
-        cap.addView(text("Просмотр · лёгкий компаньон",11,MUTED,false));
-        top.addView(cap,new LinearLayout.LayoutParams(0,-2,1));
-        TextView indicator = text(connected ? "● Wi-Fi" : "○ Wi-Fi",11,connected ? ACCENT : MUTED,true);
-        indicator.setOnClickListener(v -> connect()); top.addView(indicator);
-        base.addView(top);
-        View sep = new View(this); sep.setBackgroundColor(LINE);
-        base.addView(sep,new LinearLayout.LayoutParams(-1,dp(1)));
-        ScrollView scroll = new ScrollView(this); scroll.setFillViewport(true); scroll.setVerticalScrollBarEnabled(false);
-        body = col(); body.setPadding(dp(15),dp(9),dp(15),dp(22)); scroll.addView(body);
-        base.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
-        if (page == 0) libraryPage(); else if (page == 1) downloadsPage(); else settingsPage();
-        LinearLayout nav = row(); nav.setBackgroundColor(Color.rgb(10,26,37));
-        String[] names={"Сериалы","Загрузки","Настройки"};
-        for(int i=0;i<3;i++) {
-            final int pos=i; Button b=button(names[i],()->{page=pos;draw();});
-            b.setBackgroundTintList(ColorStateList.valueOf(i==page ? Color.rgb(20,77,93) : Color.rgb(10,26,37)));
-            nav.addView(b,new LinearLayout.LayoutParams(0,dp(57),1));
+        LinearLayout root = vertical();
+        root.setBackgroundColor(BG);
+
+        // One small header instead of a technical dashboard.
+        LinearLayout top = horizontal();
+        top.setPadding(dp(15), dp(9), dp(14), dp(9));
+        LinearLayout brand = vertical();
+        brand.addView(text("▷  Медиатека", 19, TEXT, true));
+        brand.addView(text("ЭКРАН", 10, MUTED, false));
+        top.addView(brand, new LinearLayout.LayoutParams(0, -2, 1));
+        connectionIndicator = text(connected ? "● POCO" : "○ POCO", 12, connected ? CYAN : MUTED, true);
+        connectionIndicator.setPadding(dp(12), dp(12), dp(7), dp(12));
+        connectionIndicator.setOnClickListener(v -> connect());
+        top.addView(connectionIndicator);
+        top.addView(link("⚙", this::optionsDialog), new LinearLayout.LayoutParams(dp(43), dp(46)));
+        root.addView(top);
+        View separator = new View(this);
+        separator.setBackgroundColor(BORDER);
+        root.addView(separator, new LinearLayout.LayoutParams(-1, dp(1)));
+
+        ScrollView scroller = new ScrollView(this);
+        scroller.setFillViewport(true);
+        scroller.setVerticalScrollBarEnabled(false);
+        body = vertical();
+        body.setPadding(dp(14), dp(10), dp(14), dp(14));
+        scroller.addView(body);
+        root.addView(scroller, new LinearLayout.LayoutParams(-1, 0, 1));
+        progressIndicator = null;
+        selectionIndicator = null;
+
+        if (page == 0) libraryPage(); else downloadsPage();
+
+        if (page == 0 && files.length() > 0) {
+            LinearLayout downloadActions = horizontal();
+            downloadActions.setPadding(dp(12), dp(6), dp(12), dp(5));
+            selectionIndicator = button("↓ Выбранные (" + selected.size() + ")", false, () -> queue(false));
+            downloadActions.addView(selectionIndicator, new LinearLayout.LayoutParams(0, dp(46), 1));
+            View gap = new View(this);
+            downloadActions.addView(gap, new LinearLayout.LayoutParams(dp(7), dp(1)));
+            downloadActions.addView(button("↓ Недостающие", true, () -> queue(true)),
+                    new LinearLayout.LayoutParams(0, dp(46), 1));
+            root.addView(downloadActions);
         }
-        base.addView(nav); setContentView(base);
+
+        LinearLayout nav = horizontal();
+        nav.setPadding(dp(12), dp(6), dp(12), dp(7));
+        nav.setBackgroundColor(Color.rgb(8, 24, 34));
+        TextView watch = button("▷  Смотреть", page == 0, () -> { page = 0; draw(); });
+        TextView loads = button("↓  Загрузки", page == 1, () -> { page = 1; draw(); });
+        nav.addView(watch, new LinearLayout.LayoutParams(0, dp(44), 1));
+        View gap = new View(this);
+        nav.addView(gap, new LinearLayout.LayoutParams(dp(7), dp(1)));
+        nav.addView(loads, new LinearLayout.LayoutParams(0, dp(44), 1));
+        root.addView(nav);
+        setContentView(root);
     }
+
     private void libraryPage() {
-        title("Мои серии", "Смотреть по Wi-Fi без интернета или скачать на microSD");
-        stateLine = text(status,13,ACCENT,false); body.addView(stateLine,margins(1,7));
-        LinearLayout controls=row();
-        controls.addView(button("Обновить",this::connect),new LinearLayout.LayoutParams(0,dp(46),1));
-        controls.addView(button("Подключение",this::pairDialog),new LinearLayout.LayoutParams(0,dp(46),1));
-        body.addView(controls,margins(0,10));
-        JSONObject resume=WatchHistory.last(this);
-        if(resume!=null && !resume.optBoolean("finished")) {
-            String id=resume.optString("id","");
-            card("Продолжить просмотр",resume.optString("name","Серия")+"  ·  "+(resume.optInt("position")/60000)+" мин");
-            action("▶ Продолжить",()->play(id));
+        heading("Серии", "Смотри с POCO или открой скачанное");
+        if (!paired()) {
+            LinearLayout hint = card(12);
+            hint.addView(text("Подключи POCO один раз", 14, TEXT, true));
+            hint.addView(text("Дальше приложение будет искать телефон автоматически.", 12, MUTED, false), spaced(5, 9));
+            hint.addView(button("Подключить", true, this::pairDialog));
+            body.addView(hint, spaced(0, 10));
+        } else if (!connected) {
+            LinearLayout bar = horizontal();
+            TextView label = text("Нет соединения · сохранённые серии доступны", 11, MUTED, false);
+            bar.addView(label, new LinearLayout.LayoutParams(0, -2, 1));
+            bar.addView(link("Обновить", this::connect));
+            body.addView(bar, spaced(0, 10));
+        } else {
+            LinearLayout bar = horizontal();
+            bar.addView(text("● Телефон подключён", 12, CYAN, true), new LinearLayout.LayoutParams(0, -2, 1));
+            bar.addView(link("Обновить", this::connect));
+            body.addView(bar, spaced(0, 10));
         }
-        if(files.length()==0) {
-            card("Нет серий", paired()?"Нажми «Обновить». Убедись, что POCO раздаёт библиотеку.":"Один раз введи IP и код с POCO.");
+
+        JSONObject resume = WatchHistory.last(this);
+        if (resume != null && !resume.optBoolean("finished")) {
+            String id = resume.optString("id", "");
+            LinearLayout last = card(12);
+            last.addView(text("ПРОДОЛЖИТЬ ПРОСМОТР", 10, CYAN, true));
+            TextView label = text(readableName(resume.optString("name", "Серия")), 14, TEXT, true);
+            label.setMaxLines(2);
+            last.addView(label, spaced(6, 4));
+            LinearLayout row = horizontal();
+            row.addView(text(time(resume.optInt("position")), 12, MUTED, false),
+                    new LinearLayout.LayoutParams(0, -2, 1));
+            row.addView(button("▶ Продолжить", true, () -> play(id)),
+                    new LinearLayout.LayoutParams(dp(142), dp(43)));
+            last.addView(row, spaced(2, 0));
+            body.addView(last, spaced(0, 11));
+        }
+
+        if (files.length() == 0) {
+            LinearLayout empty = card(13);
+            empty.addView(text("Библиотека пока пустая", 14, TEXT, true));
+            empty.addView(text("Добавь серии на POCO и включи раздачу. Уже скачанные видео можно открыть из загрузок.",
+                    12, MUTED, false), spaced(6, 0));
+            body.addView(empty, spaced(0, 8));
             return;
         }
-        Set<String> queued = DownloadQueue.queuedIds(this);
-        int count=Math.min(files.length(),visibleCount);
-        for(int i=0;i<count;i++) {
-            JSONObject episode=files.optJSONObject(i); if(episode==null)continue;
-            String id=episode.optString("id","");
-            LinearLayout panel=col(); panel.setPadding(dp(8),dp(8),dp(8),dp(8)); panel.setBackground(panel());
-            LinearLayout line=row(); CheckBox tick=new CheckBox(this); tick.setButtonTintList(ColorStateList.valueOf(ACCENT));
-            tick.setChecked(selected.contains(id)); tick.setOnCheckedChangeListener((b,checked)->{
-                if(checked)selected.add(id); else selected.remove(id);
-            }); line.addView(tick);
-            LinearLayout middle=col();
-            TextView name=text(episode.optString("name","Серия"),13,TEXT,true);name.setMaxLines(2);
-            middle.addView(name);
-            String state=DownloadQueue.status(this,id);
-            String suffix=DownloadQueue.DONE.equals(state)?"Скачано":queued.contains(id)?"В очереди":"На POCO";
-            middle.addView(text(MediaLibrary.readableSize(episode.optLong("size",-1))+" · "+suffix,11,MUTED,false));
-            line.addView(middle,new LinearLayout.LayoutParams(0,-2,1));
-            line.addView(button("▶",()->play(id)),new LinearLayout.LayoutParams(dp(54),dp(45)));
-            panel.addView(line); body.addView(panel,margins(0,7));
+
+        LinearLayout filterRow = horizontal();
+        String[] modes = {"Все", "Скачано", "Недостающие"};
+        for (int i = 0; i < modes.length; ++i) {
+            final int value = i;
+            TextView tab = button(modes[i], filter == i, () -> {
+                filter = value;
+                visibleCount = 36;
+                draw();
+            });
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, dp(39), 1);
+            if (i > 0) params.leftMargin = dp(5);
+            filterRow.addView(tab, params);
         }
-        if(files.length()>count)action("Показать ещё · "+(files.length()-count),()->{
-            visibleCount+=45;draw();
-        });
-        action("↓ Скачать отмеченные",()->queue(false));
-        action("↓ Скачать недостающие",()->queue(true));
+        body.addView(filterRow, spaced(0, 10));
+
+        Set<String> queued = DownloadQueue.queuedIds(this);
+        int visible = 0, total = 0;
+        for (int i = 0; i < files.length(); ++i) {
+            JSONObject entry = files.optJSONObject(i);
+            if (entry == null) continue;
+            String id = entry.optString("id", "");
+            boolean done = DownloadQueue.DONE.equals(DownloadQueue.status(this, id));
+            if ((filter == 1 && !done) || (filter == 2 && done)) continue;
+            total++;
+            if (visible >= visibleCount) continue;
+            addEpisode(entry, done, queued.contains(id));
+            visible++;
+        }
+        if (total == 0) {
+            LinearLayout empty = card(12);
+            empty.addView(text(filter == 1 ? "Пока ничего не скачано" : "Нет подходящих серий", 13, MUTED, false));
+            body.addView(empty, spaced(0, 4));
+        }
+        if (total > visible) {
+            final int left = total - visible;
+            body.addView(button("Показать ещё · " + left, false, () -> {
+                visibleCount += 36;
+                draw();
+            }), spaced(7, 5));
+        }
     }
+
+    private void addEpisode(JSONObject episode, boolean downloaded, boolean inQueue) {
+        String id = episode.optString("id", "");
+        LinearLayout outer = horizontal();
+        outer.setPadding(dp(5), dp(4), dp(6), dp(4));
+        outer.setBackground(shape(PANEL, 0, 9));
+
+        CheckBox choice = new CheckBox(this);
+        choice.setButtonTintList(ColorStateList.valueOf(CYAN));
+        choice.setChecked(selected.contains(id));
+        choice.setEnabled(!downloaded);
+        choice.setOnCheckedChangeListener((b, checked) -> {
+            if (checked) selected.add(id); else selected.remove(id);
+            if (selectionIndicator != null)
+                selectionIndicator.setText("↓ Выбранные (" + selected.size() + ")");
+        });
+        outer.addView(choice, new LinearLayout.LayoutParams(dp(42), dp(47)));
+
+        LinearLayout details = vertical();
+        TextView title = text(readableName(episode.optString("name", "Серия")), 13, TEXT, false);
+        title.setSingleLine(true);
+        title.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        details.addView(title);
+        String statusLabel = downloaded ? "Скачано · microSD" :
+                inQueue ? "В очереди" : "На POCO";
+        JSONObject mark = WatchHistory.item(this, id);
+        if (mark != null) statusLabel += mark.optBoolean("finished") ? " · Просмотрено" : " · Продолжить";
+        details.addView(text(MediaLibrary.readableSize(episode.optLong("size", -1))
+                + " · " + statusLabel, 10, downloaded ? CYAN : MUTED, false), spaced(4, 0));
+        details.setOnClickListener(v -> play(id));
+        outer.addView(details, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView playButton = button("▶", false, () -> play(id));
+        outer.addView(playButton, new LinearLayout.LayoutParams(dp(45), dp(43)));
+        body.addView(outer, spaced(0, 5));
+    }
+
     private void downloadsPage() {
-        title("Загрузки", "Очередь сохраняется при отключении Wi-Fi");
-        String folder=prefs().getString(MediaLibrary.DEST_TREE,"");
-        card("Куда сохраняются серии",folder.isEmpty()?"Папка ещё не выбрана":"Папка microSD выбрана");
-        action("Выбрать папку microSD",()->{
-            Intent open=new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
-            open.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION|Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
-            startActivityForResult(open,PICK_SD);
-        });
-        card("В очереди: "+DownloadQueue.waiting(this),DownloadQueue.paused(this)?"Пауза":"Ожидают загрузки или продолжаются");
-        progressLine=text(TransferService.progressText,13,ACCENT,false);body.addView(progressLine,margins(4,9));
-        action("▶ Продолжить очередь",()->{DownloadQueue.setPaused(this,false);autoResumeQueue();});
-        action("Пауза",()->TransferService.send(this,TransferService.PAUSE));
+        heading("Загрузки", "Файлы сохраняются непосредственно на microSD");
+        String folder = prefs().getString(MediaLibrary.DEST_TREE, "");
+        LinearLayout storage = card(11);
+        LinearLayout title = horizontal();
+        LinearLayout labels = vertical();
+        labels.addView(text("Папка сохранения", 13, TEXT, true));
+        labels.addView(text(folder.isEmpty() ? "Не выбрана" : "microSD · готова", 11,
+                folder.isEmpty() ? MUTED : CYAN, false), spaced(4, 0));
+        title.addView(labels, new LinearLayout.LayoutParams(0, -2, 1));
+        title.addView(button("Изменить", false, this::pickSd),
+                new LinearLayout.LayoutParams(dp(100), dp(42)));
+        storage.addView(title);
+        body.addView(storage, spaced(0, 12));
+
+        LinearLayout progress = card(12);
+        progress.addView(text("Очередь · " + DownloadQueue.waiting(this), 14, TEXT, true));
+        progressIndicator = text(TransferService.progressText, 12, MUTED, false);
+        progress.addView(progressIndicator, spaced(6, 8));
+        LinearLayout actions = horizontal();
+        actions.addView(button("▶ Продолжить", true, () -> {
+            DownloadQueue.setPaused(this, false);
+            autoResumeQueue();
+            draw();
+        }), new LinearLayout.LayoutParams(0, dp(43), 1));
+        View gap = new View(this);
+        actions.addView(gap, new LinearLayout.LayoutParams(dp(8), dp(1)));
+        actions.addView(button("Ⅱ Пауза", false, () -> {
+            TransferService.send(this, TransferService.PAUSE);
+            draw();
+        }), new LinearLayout.LayoutParams(0, dp(43), 1));
+        progress.addView(actions);
+        body.addView(progress, spaced(0, 12));
+
+        JSONArray all = DownloadQueue.all(this);
+        if (all.length() > 0) {
+            body.addView(text("ОЖИДАЮТ СКАЧИВАНИЯ", 11, CYAN, true), spaced(2, 7));
+            int count = Math.min(all.length(), 30);
+            for (int i = 0; i < count; i++) {
+                JSONObject job = all.optJSONObject(i);
+                if (job == null) continue;
+                LinearLayout row = card(10);
+                TextView name = text(readableName(job.optString("name", "Серия")), 12, TEXT, false);
+                name.setSingleLine(true);
+                name.setEllipsize(android.text.TextUtils.TruncateAt.END);
+                row.addView(name);
+                row.addView(text(MediaLibrary.readableSize(job.optLong("size", -1)) + " · "
+                        + (DownloadQueue.paused(this) ? "Пауза" : "В очереди"), 11, MUTED, false), spaced(4, 0));
+                body.addView(row, spaced(0, 5));
+            }
+            if (all.length() > count) body.addView(text("И ещё " + (all.length() - count)
+                    + " в очереди", 12, MUTED, false), spaced(6, 5));
+        }
+
+        int downloaded = 0;
+        for (int i = 0; i < files.length(); ++i) {
+            JSONObject item = files.optJSONObject(i);
+            if (item != null && DownloadQueue.DONE.equals(DownloadQueue.status(this, item.optString("id", "")))) downloaded++;
+        }
+        body.addView(text("СКАЧАНО · " + downloaded, 11, CYAN, true), spaced(14, 7));
+        if (downloaded == 0) {
+            body.addView(text("Здесь появятся готовые серии. Их можно смотреть без POCO.",
+                    12, MUTED, false), spaced(0, 7));
+        } else {
+            int count = 0;
+            for (int i = 0; i < files.length() && count < 35; ++i) {
+                JSONObject item = files.optJSONObject(i);
+                if (item == null) continue;
+                String id = item.optString("id", "");
+                if (!DownloadQueue.DONE.equals(DownloadQueue.status(this, id))) continue;
+                LinearLayout row = horizontal();
+                row.setPadding(dp(12), dp(5), dp(7), dp(5));
+                row.setBackground(shape(PANEL, 0, 9));
+                TextView name = text(readableName(item.optString("name", "Серия")), 12, TEXT, false);
+                name.setSingleLine(true);
+                name.setEllipsize(android.text.TextUtils.TruncateAt.END);
+                row.addView(name, new LinearLayout.LayoutParams(0, -2, 1));
+                row.addView(button("▶", false, () -> play(id)),
+                        new LinearLayout.LayoutParams(dp(44), dp(42)));
+                body.addView(row, spaced(0, 5));
+                count++;
+            }
+            if (downloaded > 35) body.addView(link("Все скачанные — во вкладке Смотреть", () -> {
+                page = 0;
+                filter = 1;
+                draw();
+            }), spaced(6, 4));
+        }
     }
-    private void settingsPage() {
-        title("Настройки", "Один раз настроил — дальше подключается само");
-        String host=prefs().getString("remote_host","");
-        card("Телефон POCO",host.isEmpty()?"Не сопряжён":"Сохранённый IP: "+host);
-        action("Изменить IP и код",this::pairDialog);
-        action("Найти POCO",this::connect);
-        preferenceToggle("auto_next_episode_v7","Автоматически следующая серия",true);
-        preferenceToggle("prefer_vlc_v7","Использовать VLC по умолчанию",false);
-        preferenceToggle("remember_volume_v7","Запоминать громкость",false);
-        card("Для Android 7", "Просмотр и передача работают без интернета, когда оба устройства находятся в одной сети Wi-Fi.");
+
+    private String readableName(String raw) {
+        String name = raw == null ? "Серия" : raw;
+        if (name.endsWith(".mp4") || name.endsWith(".mkv") || name.endsWith(".avi")
+                || name.endsWith(".webm")) name = name.substring(0, name.lastIndexOf('.'));
+        return name.replace('_', ' ').replaceAll("\\s+", " ").trim();
     }
-    private void preferenceToggle(String key,String label,boolean def) {
-        CheckBox box=new CheckBox(this);box.setText(label);box.setTextColor(TEXT);box.setButtonTintList(ColorStateList.valueOf(ACCENT));
-        box.setChecked(prefs().getBoolean(key,def));box.setOnCheckedChangeListener((b,enabled)->prefs().edit().putBoolean(key,enabled).apply());
-        body.addView(box,margins(7,5));
+
+    private String time(int millis) {
+        int seconds = Math.max(0, millis) / 1000;
+        return String.format(java.util.Locale.ROOT, "%02d:%02d", seconds / 60, seconds % 60);
     }
+
+    private void optionsDialog() {
+        final boolean autoNext = prefs().getBoolean("auto_next_episode_v7", true);
+        final boolean vlc = prefs().getBoolean("prefer_vlc_v7", false);
+        final String[] actions = {
+                "Обновить подключение",
+                "Изменить IP и код POCO",
+                "Выбрать папку microSD",
+                "Следующая серия автоматически · " + (autoNext ? "Вкл" : "Выкл"),
+                "VLC по умолчанию · " + (vlc ? "Вкл" : "Выкл")
+        };
+        new AlertDialog.Builder(this).setTitle("Параметры просмотра")
+                .setItems(actions, (dialog, which) -> {
+                    switch (which) {
+                        case 0: connect(); break;
+                        case 1: pairDialog(); break;
+                        case 2: pickSd(); break;
+                        case 3:
+                            prefs().edit().putBoolean("auto_next_episode_v7", !autoNext).apply();
+                            toast("Автоследующая серия: " + (!autoNext ? "включена" : "выключена"));
+                            break;
+                        case 4:
+                            prefs().edit().putBoolean("prefer_vlc_v7", !vlc).apply();
+                            toast("VLC: " + (!vlc ? "по умолчанию" : "выключен"));
+                            break;
+                    }
+                }).setNegativeButton("Закрыть", null).show();
+    }
+
+    private void pickSd() {
+        Intent select = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        select.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION |
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION |
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        startActivityForResult(select, PICK_SD);
+    }
+
     private void pairDialog() {
-        LinearLayout wrapper=col();wrapper.setPadding(dp(22),dp(10),dp(22),0);
-        EditText host=new EditText(this);host.setSingleLine(true);host.setText(prefs().getString("remote_host",""));
-        host.setHint("IP POCO (можно оставить пустым)");host.setTextColor(TEXT);host.setHintTextColor(MUTED);
+        LinearLayout form = vertical();
+        form.setPadding(dp(22), dp(10), dp(22), dp(4));
+        EditText host = new EditText(this);
+        host.setSingleLine(true);
+        host.setText(prefs().getString("remote_host", ""));
+        host.setHint("IP телефона (можно оставить пустым)");
+        host.setTextColor(TEXT);
+        host.setHintTextColor(MUTED);
         host.setInputType(InputType.TYPE_CLASS_TEXT);
-        EditText code=new EditText(this);code.setSingleLine(true);code.setHint("Код из 8 цифр");
-        code.setText(prefs().getString("remote_code",""));code.setTextColor(TEXT);code.setHintTextColor(MUTED);
-        code.setInputType(InputType.TYPE_CLASS_NUMBER);wrapper.addView(host);wrapper.addView(code);
-        new AlertDialog.Builder(this).setTitle("Подключение к POCO").setView(wrapper)
-                .setNegativeButton("Отмена",null).setPositiveButton("Сохранить",(d,which)->{
-                    String secret=code.getText().toString().trim();
-                    if(!secret.matches("[0-9]{8}")){toast("Нужен восьмизначный код");return;}
-                    String ip=host.getText().toString().trim();
-                    try { if(!ip.isEmpty())ip=DownloadEngine.validatedHost(ip); }
-                    catch(Exception e){toast("Неверный IP");return;}
-                    prefs().edit().putString("remote_host",ip).putString("remote_code",secret).commit();
-                    TransferService.send(this,TransferService.START_RECEIVER);
+        form.addView(host);
+        EditText code = new EditText(this);
+        code.setSingleLine(true);
+        code.setText(prefs().getString("remote_code", ""));
+        code.setHint("Код POCO · 8 цифр");
+        code.setTextColor(TEXT);
+        code.setHintTextColor(MUTED);
+        code.setInputType(InputType.TYPE_CLASS_NUMBER);
+        form.addView(code);
+        new AlertDialog.Builder(this).setTitle("Подключение к POCO").setView(form)
+                .setNegativeButton("Отмена", null)
+                .setPositiveButton("Сохранить", (d, which) -> {
+                    String password = code.getText().toString().trim();
+                    if (!password.matches("[0-9]{8}")) { toast("Нужен код из 8 цифр"); return; }
+                    String ip = host.getText().toString().trim();
+                    try { if (!ip.isEmpty()) ip = DownloadEngine.validatedHost(ip); }
+                    catch (Exception ignored) { toast("Неверный IP телефона"); return; }
+                    prefs().edit().putString("remote_host", ip).putString("remote_code", password).commit();
+                    TransferService.send(this, TransferService.START_RECEIVER);
                     connect();
                 }).show();
     }
+
     private void connect() {
-        if(connecting || closed)return;
-        if(!paired()){pairDialog();return;}
-        connecting=true;status="Подключаюсь к POCO…";
-        network.execute(()->{
-            String secret=prefs().getString("remote_code","");
-            String current=prefs().getString("remote_host","");
-            List<String> candidates=new ArrayList<>();
-            if(!current.isEmpty())candidates.add(current);
-            for(String ip:LanDiscovery.find(this))if(!candidates.contains(ip))candidates.add(ip);
-            JSONObject listing=null;String found="";String error="Телефон не найден в Wi-Fi";
-            for(String ip:candidates) {
-                try {listing=new JSONObject(DownloadEngine.list(ip,secret));found=ip;break;}
-                catch(Exception e){error=e.getMessage()==null?error:e.getMessage();}
+        if (closed || connecting) return;
+        if (!paired()) { pairDialog(); return; }
+        connecting = true;
+        lastConnectAttempt = SystemClock.elapsedRealtime();
+        network.execute(() -> {
+            String secret = prefs().getString("remote_code", "");
+            String current = prefs().getString("remote_host", "");
+            List<String> targets = new ArrayList<>();
+            if (!current.isEmpty()) targets.add(current);
+            for (String ip : LanDiscovery.find(this)) if (!targets.contains(ip)) targets.add(ip);
+            JSONObject response = null;
+            String found = "";
+            for (String ip : targets) {
+                try { response = new JSONObject(DownloadEngine.list(ip, secret)); found = ip; break; }
+                catch (Exception ignored) { }
             }
-            final String resolved=found, reason=error;final JSONObject data=listing;
-            if(data!=null) {
-                JSONArray a=data.optJSONArray("files");
-                if(a==null)a=new JSONArray();
-                final JSONArray catalog=a;
-                final String stream=data.optString("stream_ticket","");
-                prefs().edit().putString("remote_host",resolved).putString("remote_cache",catalog.toString()).commit();
-                String previous=current;
-                try { DownloadQueue.reconcile(this,catalog,previous,resolved); }
-                catch(Exception ignored){}
-                handler.post(()->{
-                    if(closed)return;connected=true;status="● POCO подключён · "+catalog.length()+" серий";
-                    files=catalog;ticket=stream;connecting=false;draw();autoResumeQueue();
-                });
-            } else handler.post(()->{
-                if(closed)return;connecting=false;connected=false;status="Нет соединения: "+reason;draw();
+            final JSONObject result = response;
+            final String resolved = found;
+            JSONArray remoteFiles = null;
+            if (result != null) {
+                remoteFiles = result.optJSONArray("files");
+                if (remoteFiles == null) remoteFiles = new JSONArray();
+                // SAF file checks can be slow on a 1 GB Huawei: NEVER run on the UI thread.
+                String previous = prefs().getString("remote_host", "");
+                try { DownloadQueue.reconcile(this, remoteFiles, previous, resolved); }
+                catch (Exception ignored) { }
+                prefs().edit().putString("remote_host", resolved)
+                        .putString("remote_cache", remoteFiles.toString()).commit();
+            }
+            final JSONArray incoming = remoteFiles;
+            handler.post(() -> {
+                if (closed) return;
+                connecting = false;
+                if (result == null) {
+                    boolean wasConnected = connected;
+                    connected = false;
+                    status = "Нет связи с POCO";
+                    if (wasConnected) draw();
+                    return;
+                }
+                boolean changed = !incoming.toString().equals(files.toString()) || !connected;
+                files = incoming;
+                ticket = result.optString("stream_ticket", "");
+                connected = true;
+                status = "Подключено · " + files.length();
+                if (changed) draw();
+                autoResumeQueue();
             });
         });
     }
+
     private void play(String id) {
-        if(!id.matches("[0-9a-f]{24}")){toast("Серия недоступна");return;}
-        if(!connected || !ticket.matches("[0-9a-f]{48}")) {
-            if(DownloadQueue.DONE.equals(DownloadQueue.status(this,id))) {
-                String folder=prefs().getString(MediaLibrary.DEST_TREE,"");
-                if(!folder.isEmpty())try {
-                    Uri uri=DownloadQueue.knownFile(this,id,Uri.parse(folder),
-                            prefs().getString("remote_host",""),prefs().getString("remote_host",""));
-                    if(uri!=null){
-                        Intent watch=new Intent(Intent.ACTION_VIEW)
-                                .setDataAndType(uri,"video/*")
+        if (!id.matches("[0-9a-f]{24}")) { toast("Серия недоступна"); return; }
+        if (!connected || !ticket.matches("[0-9a-f]{48}")) {
+            if (DownloadQueue.DONE.equals(DownloadQueue.status(this, id))) {
+                String folder = prefs().getString(MediaLibrary.DEST_TREE, "");
+                if (!folder.isEmpty()) try {
+                    Uri file = DownloadQueue.knownFile(this, id, Uri.parse(folder),
+                            prefs().getString("remote_host", ""), prefs().getString("remote_host", ""));
+                    if (file != null) {
+                        Intent watch = new Intent(Intent.ACTION_VIEW)
+                                .setDataAndType(file, "video/*")
                                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                        startActivity(Intent.createChooser(watch,"Воспроизвести офлайн"));
+                        startActivity(Intent.createChooser(watch, "Открыть скачанную серию"));
                         return;
                     }
-                } catch(Exception ignored) { }
+                } catch (Exception ignored) { }
             }
-            toast("POCO не подключён; скачанные серии можно открыть офлайн");return;
+            toast("Нет связи с POCO · скачанные серии доступны офлайн");
+            return;
         }
-        Intent in=new Intent(this,RemotePlayerActivity.class).putExtra("remote_action","play")
-                .putExtra("remote_id",id).putExtra("remote_ticket",ticket);
-        startActivity(in);
+        startActivity(new Intent(this, RemotePlayerActivity.class)
+                .putExtra("remote_action", "play")
+                .putExtra("remote_id", id)
+                .putExtra("remote_ticket", ticket));
     }
+
     private void queue(boolean missing) {
-        if(!connected){toast("Сначала подключись к POCO");return;}
-        if(prefs().getString(MediaLibrary.DEST_TREE,"").isEmpty()){page=1;draw();toast("Сначала выбери microSD");return;}
-        JSONArray chosen=new JSONArray();
-        for(int i=0;i<files.length();i++) {
-            JSONObject entry=files.optJSONObject(i);if(entry==null)continue;
-            String id=entry.optString("id","");
-            if(DownloadQueue.DONE.equals(DownloadQueue.status(this,id)))continue;
-            if(missing||selected.contains(id))chosen.put(entry);
+        if (!connected) { toast("Подключи POCO для загрузки"); return; }
+        if (prefs().getString(MediaLibrary.DEST_TREE, "").isEmpty()) {
+            page = 1;
+            draw();
+            toast("Сначала выбери папку microSD");
+            return;
         }
-        int count=DownloadQueue.enqueue(this,chosen);selected.clear();
-        toast(count>0?"Добавлено: "+count:"Новых серий нет");
-        page=1;draw();autoResumeQueue();
+        JSONArray chosen = new JSONArray();
+        for (int i = 0; i < files.length(); ++i) {
+            JSONObject item = files.optJSONObject(i);
+            if (item == null) continue;
+            String id = item.optString("id", "");
+            if (DownloadQueue.DONE.equals(DownloadQueue.status(this, id))) continue;
+            if (missing || selected.contains(id)) chosen.put(item);
+        }
+        int added = DownloadQueue.enqueue(this, chosen);
+        selected.clear();
+        toast(added > 0 ? "Добавлено в очередь: " + added : "Новых серий нет");
+        page = 1;
+        draw();
+        autoResumeQueue();
     }
+
     private void autoResumeQueue() {
-        if(!connected||DownloadQueue.paused(this)||TransferService.downloading)return;
-        if(prefs().getString(MediaLibrary.DEST_TREE,"").isEmpty())return;
-        JSONArray pending=DownloadQueue.availablePending(this,files);
-        if(pending.length()==0)return;
-        TransferService.download(this,prefs().getString("remote_host",""),prefs().getString("remote_code",""),
-                prefs().getString(MediaLibrary.DEST_TREE,""),pending);
+        if (!connected || DownloadQueue.paused(this) || TransferService.downloading) return;
+        String folder = prefs().getString(MediaLibrary.DEST_TREE, "");
+        if (folder.isEmpty()) return;
+        JSONArray pending = DownloadQueue.availablePending(this, files);
+        if (pending.length() == 0) return;
+        TransferService.download(this, prefs().getString("remote_host", ""),
+                prefs().getString("remote_code", ""), folder, pending);
     }
-    @Override protected void onActivityResult(int request,int result,Intent data) {
-        super.onActivityResult(request,result,data);
-        if(request!=PICK_SD||result!=RESULT_OK||data==null||data.getData()==null)return;
-        Uri tree=data.getData();
-        try {getContentResolver().takePersistableUriPermission(tree,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-            String old=prefs().getString(MediaLibrary.DEST_TREE,"");
-            if(!tree.toString().equals(old)){
-                prefs().edit().putString(MediaLibrary.DEST_TREE,tree.toString()).commit();
+
+    @Override protected void onActivityResult(int request, int result, Intent data) {
+        super.onActivityResult(request, result, data);
+        if (request != PICK_SD || result != RESULT_OK || data == null || data.getData() == null) return;
+        Uri tree = data.getData();
+        try {
+            getContentResolver().takePersistableUriPermission(tree,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            String last = prefs().getString(MediaLibrary.DEST_TREE, "");
+            if (!tree.toString().equals(last)) {
+                prefs().edit().putString(MediaLibrary.DEST_TREE, tree.toString()).commit();
                 DownloadQueue.destinationChanged(this);
             }
-            draw();autoResumeQueue();
-        }catch(Exception e){toast("Нет доступа к microSD: "+e.getMessage());}
+            draw();
+            autoResumeQueue();
+        } catch (Exception e) { toast("Нет доступа к microSD"); }
     }
-    private void toast(String message){Toast.makeText(this,message,Toast.LENGTH_SHORT).show();}
+
+    private void toast(String value) {
+        Toast.makeText(this, value, Toast.LENGTH_SHORT).show();
+    }
 }
