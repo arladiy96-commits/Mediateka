@@ -21,6 +21,7 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity android:name=".RemotePlayerActivity" android:exported="false" />
         <service android:name=".TransferService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
