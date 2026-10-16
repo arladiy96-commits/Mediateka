@@ -49,12 +49,12 @@ public final class MainActivity extends Activity {
     private static final int PICK_FILES = 101;
     private static final int PICK_SOURCE_FOLDER = 102;
     private static final int PICK_SD_FOLDER = 103;
-    private static final int BG = Color.rgb(14, 21, 28);
-    private static final int PANEL = Color.rgb(27, 39, 49);
-    private static final int DIVIDER = Color.rgb(44, 60, 69);
-    private static final int ACCENT = Color.rgb(102, 205, 181);
-    private static final int WHITE = Color.rgb(241, 245, 245);
-    private static final int MUTED = Color.rgb(154, 171, 177);
+    private static final int BG = Color.rgb(5, 15, 23);
+    private static final int PANEL = Color.rgb(14, 32, 44);
+    private static final int DIVIDER = Color.rgb(28, 57, 72);
+    private static final int ACCENT = Color.rgb(25, 204, 231);
+    private static final int WHITE = Color.rgb(234, 245, 251);
+    private static final int MUTED = Color.rgb(140, 166, 180);
 
     private LinearLayout content;
     private LinearLayout targetsPanel;
@@ -65,6 +65,7 @@ public final class MainActivity extends Activity {
     private volatile boolean refreshingDevices;
     private final ExecutorService actions = Executors.newSingleThreadExecutor();
     private TextView hostInfo;
+    private TextView compactStatus;
     private TextView linkStatus;
     private TextView transferStatus;
     private Button downloadButton;
@@ -73,6 +74,11 @@ public final class MainActivity extends Activity {
     private final Set<String> chosen = new HashSet<>();
     private JSONArray remoteFiles = new JSONArray();
     private String streamTicket = "";
+    // page 0: library, 1: connected screens, 2: downloads/files, 3: settings.
+    private int page;
+    private String openCollection = "";
+    private int visibleItems = 60;
+    private String deviceLabel = "";
     private int mode;
     private boolean connecting;
     private boolean disposed;
@@ -97,6 +103,11 @@ public final class MainActivity extends Activity {
                 }
             }
             if (linkStatus != null) linkStatus.setText(statusMessage);
+            if (compactStatus != null) {
+                boolean active = mode == 0 ? TransferService.serverRunning : linkConnected;
+                compactStatus.setText(active ? "●  Подключено" : "○  Не подключено");
+                compactStatus.setTextColor(active ? ACCENT : MUTED);
+            }
             if (pauseButton != null) pauseButton.setVisibility(TransferService.downloading ? View.VISIBLE : View.GONE);
             if (transferStatus != null) {
                 String description = TransferService.progressText;
@@ -134,6 +145,7 @@ public final class MainActivity extends Activity {
         getWindow().setNavigationBarColor(BG);
         SharedPreferences prefs = MediaLibrary.prefs(this);
         mode = prefs.getInt("screen", 0);
+        page = 0;
         chosenDevice = prefs.getString("selected_remote_device", "");
         try { remoteFiles = new JSONArray(prefs.getString("remote_cache", "[]")); }
         catch (Exception ignored) { remoteFiles = new JSONArray(); }
@@ -178,52 +190,202 @@ public final class MainActivity extends Activity {
         transferStatus = null;
         downloadButton = null;
         pauseButton = null;
+        compactStatus = null;
         episodeChecks.clear();
 
         LinearLayout screen = column();
         screen.setBackgroundColor(BG);
-        screen.setPadding(0, 0, 0, 0);
+        LinearLayout header = row();
+        header.setPadding(dp(17), dp(15), dp(14), dp(12));
+        TextView logo = text("▷", 29, ACCENT, true);
+        header.addView(logo, new LinearLayout.LayoutParams(dp(34), dp(44)));
+        LinearLayout headerText = column();
+        headerText.addView(text("Медиатека", 20, WHITE, true));
+        headerText.addView(text(mode == 0 ? "Библиотека POCO" : "Библиотека Huawei", 11, MUTED, false));
+        header.addView(headerText, new LinearLayout.LayoutParams(0, -2, 1));
+        compactStatus = text("○  Соединение", 11, MUTED, true);
+        compactStatus.setGravity(Gravity.CENTER_VERTICAL);
+        header.addView(compactStatus);
+        compactStatus.setOnClickListener(v -> navigate(1));
+        screen.addView(header);
+        View line = new View(this);
+        line.setBackgroundColor(DIVIDER);
+        screen.addView(line, new LinearLayout.LayoutParams(-1, dp(1)));
 
-        LinearLayout top = column();
-        top.setPadding(dp(18), dp(18), dp(18), dp(10));
-        top.addView(text("МЕДИАТЕКА", 23, WHITE, true));
-        top.addView(text("Сериалы рядом, без интернета", 12, MUTED, false));
-        screen.addView(top);
-
-        LinearLayout tabs = row();
-        tabs.setPadding(dp(14), dp(3), dp(14), dp(10));
-        Button sender = button("Телефон", mode == 0);
-        Button receiver = button("Планшет", mode == 1);
-        tabs.addView(sender, new LinearLayout.LayoutParams(0, dp(42), 1));
-        LinearLayout.LayoutParams tab2 = new LinearLayout.LayoutParams(0, dp(42), 1);
-        tab2.leftMargin = dp(6);
-        tabs.addView(receiver, tab2);
-        sender.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { chooseMode(0); }
-        });
-        receiver.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { chooseMode(1); }
-        });
-        screen.addView(tabs);
-
+        LinearLayout work = row();
+        final boolean sidebar = getResources().getConfiguration().orientation
+                == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+                && getResources().getConfiguration().screenWidthDp >= 650;
+        if (sidebar) {
+            LinearLayout rail = column();
+            rail.setPadding(dp(8), dp(12), dp(8), dp(8));
+            rail.setBackgroundColor(Color.rgb(9, 23, 34));
+            addSideNavigation(rail);
+            work.addView(rail, new LinearLayout.LayoutParams(dp(152), -1));
+            View border = new View(this);
+            border.setBackgroundColor(DIVIDER);
+            work.addView(border, new LinearLayout.LayoutParams(dp(1), -1));
+        }
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
         scroll.setVerticalScrollBarEnabled(false);
         content = column();
-        content.setPadding(dp(14), dp(2), dp(14), dp(16));
+        content.setPadding(dp(16), dp(11), dp(16), dp(24));
         scroll.addView(content);
-        screen.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
-        if (mode == 0) showSender();
-        else {
-            showReceiver();
-            buildBottomBar(screen);
-        }
+        work.addView(scroll, new LinearLayout.LayoutParams(0, -1, 1));
+        screen.addView(work, new LinearLayout.LayoutParams(-1, 0, 1));
+
+        if (mode == 0) showSender(); else showReceiver();
+        if (mode == 1 && page == 0 && !openCollection.isEmpty() && remoteFiles.length() > 0) buildBottomBar(screen);
+        if (!sidebar) addBottomNavigation(screen);
         setContentView(screen);
     }
 
-    private void chooseMode(int next) {
+    private void navigate(int next) {
+        if (page == next && openCollection.isEmpty()) return;
+        page = next;
+        openCollection = "";
+        visibleItems = 60;
+        render();
+    }
+
+    private String[] pageNames() {
+        return mode == 0
+                ? new String[]{"Главная", "Устройства", "Файлы", "Настройки"}
+                : new String[]{"Главная", "Телефон", "Загрузки", "Настройки"};
+    }
+
+    private String[] pageIcons() { return new String[]{"⌂", "▣", "⇩", "⚙"}; }
+
+    private void addBottomNavigation(LinearLayout screen) {
+        LinearLayout nav = row();
+        nav.setBackgroundColor(Color.rgb(9, 23, 34));
+        nav.setPadding(dp(6), dp(6), dp(6), dp(6));
+        for (int i = 0; i < 4; i++) {
+            final int target = i;
+            LinearLayout entry = column();
+            entry.setGravity(Gravity.CENTER);
+            entry.setPadding(dp(2), dp(4), dp(2), dp(4));
+            if (page == i) entry.setBackground(background(PANEL, 9));
+            TextView mark = text(pageIcons()[i], 21, page == i ? ACCENT : MUTED, false);
+            mark.setGravity(Gravity.CENTER);
+            entry.addView(mark);
+            TextView title = text(pageNames()[i], 10, page == i ? ACCENT : MUTED, page == i);
+            title.setGravity(Gravity.CENTER);
+            entry.addView(title);
+            entry.setOnClickListener(v -> navigate(target));
+            nav.addView(entry, new LinearLayout.LayoutParams(0, dp(52), 1));
+        }
+        screen.addView(nav);
+    }
+
+    private void addSideNavigation(LinearLayout nav) {
+        for (int i = 0; i < 4; i++) {
+            final int target = i;
+            TextView label = text(pageIcons()[i] + "   " + pageNames()[i], 13,
+                    page == i ? ACCENT : MUTED, page == i);
+            label.setGravity(Gravity.CENTER_VERTICAL);
+            label.setPadding(dp(10), 0, dp(3), 0);
+            if (page == i) label.setBackground(background(PANEL, 9));
+            nav.addView(label, spaced(0, 7));
+            label.getLayoutParams().height = dp(48);
+            label.setOnClickListener(v -> navigate(target));
+        }
+    }
+
+    private void pageTitle(String title, String subtitle) {
+        content.addView(text(title, 22, WHITE, true), spaced(4, 3));
+        if (!subtitle.isEmpty()) content.addView(text(subtitle, 12, MUTED, false), spaced(0, 16));
+        else content.addView(new View(this), spaced(0, 10));
+    }
+
+    private LinearLayout slimPanel() {
+        LinearLayout box = panel();
+        box.setPadding(dp(13), dp(12), dp(13), dp(12));
+        return box;
+    }
+
+    private void cardRow(String icon, String title, String subtitle, String trail,
+                         View.OnClickListener listener) {
+        LinearLayout box = slimPanel();
+        LinearLayout line = row();
+        TextView symbol = text(icon, 23, ACCENT, false);
+        symbol.setGravity(Gravity.CENTER);
+        line.addView(symbol, new LinearLayout.LayoutParams(dp(39), dp(46)));
+        LinearLayout desc = column();
+        TextView main = text(title, 14, WHITE, true);
+        main.setSingleLine(true);
+        main.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        desc.addView(main);
+        if (!subtitle.isEmpty()) desc.addView(text(subtitle, 11, MUTED, false), spaced(3, 0));
+        line.addView(desc, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView end = text(trail, 16, ACCENT, false);
+        end.setGravity(Gravity.CENTER);
+        line.addView(end);
+        box.addView(line);
+        if (listener != null) box.setOnClickListener(listener);
+        content.addView(box, spaced(0, 8));
+    }
+
+    private void thinHeading(String title, String action, View.OnClickListener onClick) {
+        LinearLayout line = row();
+        line.addView(text(title, 15, WHITE, true), new LinearLayout.LayoutParams(0, -2, 1));
+        if (action != null && !action.isEmpty()) {
+            TextView link = text(action, 12, ACCENT, true);
+            link.setPadding(dp(7), dp(8), dp(2), dp(8));
+            link.setOnClickListener(onClick);
+            line.addView(link);
+        }
+        content.addView(line, spaced(12, 8));
+    }
+
+    private void roleSettings() {
+        thinHeading("Устройство", null, null);
+        cardRow("▣", "Режим: " + (mode == 0 ? "Телефон" : "Планшет"),
+                "Переключить роль этого устройства", "›", v -> {
+                    new AlertDialog.Builder(this).setTitle("Режим устройства")
+                            .setItems(new String[]{"Телефон — раздача", "Планшет — просмотр"},
+                                    (d, which) -> chooseMode(which)).show();
+                });
+    }
+
+    private void sourceFolderPicker() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        startActivityForResult(intent, PICK_SOURCE_FOLDER);
+    }
+    private void sourceFilesPicker() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        startActivityForResult(intent, PICK_FILES);
+    }
+    private void destinationPicker() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        startActivityForResult(intent, PICK_SD_FOLDER);
+    }
+
+    /** Folder-like collections are inferred only from actual filenames, not invented metadata. */
+    private String collectionName(String filename) {
+        String raw = filename.replace('_', ' ').replace('.', ' ').trim();
+        java.util.regex.Matcher pattern = java.util.regex.Pattern.compile(
+                "(?i)\\b(?:[0-9]{1,2}\\s*сезон|сезон\\s*[0-9]{1,2}|s[0-9]{1,2}e[0-9]{1,3}|[0-9]{1,3}\\s*серия|серия\\s*[0-9]{1,3})\\b")
+                .matcher(raw);
+        if (pattern.find() && pattern.start() > 1) {
+            return raw.substring(0, pattern.start()).replaceAll("[-\\s]+$", "").trim();
+        }
+        return "Другие видео";
+    }
+
+        private void chooseMode(int next) {
         if (mode == next) return;
         mode = next;
+        page = 0;
+        openCollection = "";
         linkConnected = false;
         streamTicket = "";
         MediaLibrary.prefs(this).edit().putInt("screen", mode).apply();
@@ -238,91 +400,80 @@ public final class MainActivity extends Activity {
     }
 
     private void showSender() {
-        sectionTitle("Доступ с планшета", "Телефон и Huawei должны быть в одной сети Wi-Fi.");
-        LinearLayout statusBox = panel();
-        hostInfo = text("Проверяю раздачу...", 17, ACCENT, true);
-        statusBox.addView(hostInfo);
-        content.addView(statusBox, spaced(0, 12));
-        rowActions("Включить / обновить", "Остановить",
-                new View.OnClickListener() {
-                    @Override public void onClick(View v) {
-                        MediaLibrary.prefs(MainActivity.this).edit().putBoolean("auto_share", true).apply();
-                        TransferService.send(MainActivity.this, TransferService.START_SERVER);
-                        toast("Обновляю список сериалов");
-                    }
-                }, new View.OnClickListener() {
-                    @Override public void onClick(View v) {
-                        MediaLibrary.prefs(MainActivity.this).edit().putBoolean("auto_share", false).apply();
-                        TransferService.send(MainActivity.this, TransferService.STOP_SERVER);
-                    }
-                });
-        note("Код постоянный: после первого подключения Huawei запомнит телефон.");
-
-        sectionTitle("На каком экране смотреть", "Huawei, приставка и магнитола появятся после подключения к этому POCO.");
-        targetsPanel = panel();
-        targetsPanel.addView(text("Ищу устройства...", 13, MUTED, false));
-        content.addView(targetsPanel, spaced(0, 8));
-        action("Обновить список экранов", false, new View.OnClickListener() {
-            @Override public void onClick(View v) { refreshRemoteDevices(); }
-        });
-        sectionTitle("Управлять просмотром", "Сначала выбери экран, затем серию ниже.");
-        rowActions("Пауза", "Продолжить", v -> sendToRemote("pause", ""),
-                v -> sendToRemote("resume", ""));
-        rowActions("−30 секунд", "+30 секунд", v -> sendToRemote("seek_back", ""),
-                v -> sendToRemote("seek_forward", ""));
-        rowActions("Предыдущая", "Следующая", v -> sendToRemote("previous", ""),
-                v -> sendToRemote("next", ""));
-        rowActions("Тише", "Громче", v -> sendToRemote("volume_down", ""),
-                v -> sendToRemote("volume_up", ""));
-        link("Остановить просмотр", v -> sendToRemote("stop", ""));
-        sectionTitle("Запустить серию на экране", "Нажми ▶ рядом с серией — она откроется на выбранном устройстве.");
-        remoteLibraryPanel = panel();
-        remoteLibraryPanel.addView(text("Загружаю список...", 13, MUTED, false));
-        content.addView(remoteLibraryPanel, spaced(0, 12));
-        scanSenderEpisodes();
-        refreshRemoteDevices();
-
-        sectionTitle("Твои серии", "Можно добавить отдельные файлы или всю папку с сезонами.");
-        LinearLayout library = panel();
-        final TextView count = text("Читаю библиотеку...", 15, WHITE, true);
-        final TextView preview = text("", 12, MUTED, false);
-        library.addView(count);
-        LinearLayout.LayoutParams previewParams = spaced(6, 0);
-        library.addView(preview, previewParams);
-        content.addView(library, spaced(0, 10));
-        scanLocal(count, preview);
-        action("Выбрать папку с сериалами", true, new View.OnClickListener() {
-            @Override public void onClick(View v) {
-                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
-                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
-                startActivityForResult(intent, PICK_SOURCE_FOLDER);
+        if (page == 1) {
+            pageTitle("Устройства", "Выбери экран для удалённого просмотра");
+            targetsPanel = slimPanel();
+            targetsPanel.addView(text("Ищу подключённые устройства…", 12, MUTED, false));
+            content.addView(targetsPanel, spaced(0, 8));
+            action("Обновить устройства", false, v -> refreshRemoteDevices());
+            thinHeading("Пульт управления", "", null);
+            if (chosenDevice.isEmpty()) {
+                cardRow("▣", "Устройство не выбрано", "Открой Медиатеку на Huawei или приставке", "", null);
+            } else {
+                cardRow("▣", "Экран выбран", "Команды отправляются на него", "✓", null);
+                rowActions("◀◀", "▶▶", v -> sendToRemote("previous", ""), v -> sendToRemote("next", ""));
+                rowActions("−30 сек", "+30 сек", v -> sendToRemote("seek_back", ""), v -> sendToRemote("seek_forward", ""));
+                rowActions("Пауза", "▶ Продолжить", v -> sendToRemote("pause", ""), v -> sendToRemote("resume", ""));
+                rowActions("− Громкость", "+ Громкость", v -> sendToRemote("volume_down", ""), v -> sendToRemote("volume_up", ""));
+                link("■  Остановить воспроизведение", v -> sendToRemote("stop", ""));
             }
-        });
-        action("Добавить отдельные серии", false, new View.OnClickListener() {
-            @Override public void onClick(View v) {
-                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-                intent.addCategory(Intent.CATEGORY_OPENABLE);
-                intent.setType("*/*");
-                intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
-                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
-                startActivityForResult(intent, PICK_FILES);
-            }
-        });
-        link("Очистить список серий", new View.OnClickListener() {
-            @Override public void onClick(View v) {
-                new AlertDialog.Builder(MainActivity.this).setTitle("Очистить библиотеку?")
-                        .setMessage("Файлы на телефоне останутся. Удалится только список для раздачи.")
-                        .setNegativeButton("Отмена", null)
-                        .setPositiveButton("Очистить", (d, w) -> {
-                            MediaLibrary.clearSources(MainActivity.this);
-                            TransferService.send(MainActivity.this, TransferService.STOP_SERVER);
-                            render();
-                        }).show();
-            }
-        });
+            refreshRemoteDevices();
+        } else if (page == 2) {
+            pageTitle("Файлы на телефоне", "Управление папками для раздачи");
+            LinearLayout status = slimPanel();
+            hostInfo = text("Проверяю сервер…", 13, ACCENT, true);
+            status.addView(hostInfo);
+            content.addView(status, spaced(0, 12));
+            action("+  Выбрать папку с сериалами", true, v -> sourceFolderPicker());
+            action("Добавить отдельные видео", false, v -> sourceFilesPicker());
+            thinHeading("Библиотека", null, null);
+            LinearLayout catalogStatus = slimPanel();
+            TextView count = text("Загружаю список…", 14, WHITE, true);
+            TextView preview = text("", 12, MUTED, false);
+            catalogStatus.addView(count); catalogStatus.addView(preview, spaced(6, 0));
+            content.addView(catalogStatus, spaced(0, 10));
+            scanLocal(count, preview);
+            link("Очистить библиотеку", v -> new AlertDialog.Builder(this)
+                    .setTitle("Убрать файлы из библиотеки?")
+                    .setMessage("Сами видео на POCO останутся.")
+                    .setNegativeButton("Отмена", null)
+                    .setPositiveButton("Убрать", (d, w) -> {
+                        MediaLibrary.clearSources(this);
+                        TransferService.send(this, TransferService.STOP_SERVER);
+                        render();
+                    }).show());
+        } else if (page == 3) {
+            pageTitle("Настройки", "Подключение, передача и устройство");
+            roleSettings();
+            thinHeading("Раздача по Wi-Fi", null, null);
+            LinearLayout box = slimPanel();
+            hostInfo = text("Проверяю адрес…", 13, ACCENT, true);
+            box.addView(hostInfo);
+            content.addView(box, spaced(0, 8));
+            rowActions("Включить", "Выключить", v -> {
+                MediaLibrary.prefs(this).edit().putBoolean("auto_share", true).apply();
+                TransferService.send(this, TransferService.START_SERVER);
+            }, v -> {
+                MediaLibrary.prefs(this).edit().putBoolean("auto_share", false).apply();
+                TransferService.send(this, TransferService.STOP_SERVER);
+            });
+            note("IP и код вводятся на новом устройстве только при первом сопряжении.");
+            cardRow("▤", "Папки и файлы", "Добавить или убрать видео", "›", v -> navigate(2));
+        } else {
+            pageTitle(openCollection.isEmpty() ? "Мои сериалы" : openCollection,
+                    openCollection.isEmpty() ? "Выбери видео для воспроизведения" : "Нажми ▶ для запуска на выбранном экране");
+            cardRow("▣", chosenDevice.isEmpty() ? "Выбрать экран" : "Экран выбран",
+                    chosenDevice.isEmpty() ? "Huawei, приставка или магнитола" : "Управление доступно на вкладке Устройства",
+                    "›", v -> navigate(1));
+            remoteLibraryPanel = column();
+            remoteLibraryPanel.addView(text("Загружаю библиотеку…", 12, MUTED, false));
+            content.addView(remoteLibraryPanel, spaced(8, 10));
+            scanSenderEpisodes();
+            action("+  Добавить сериалы", false, v -> navigate(2));
+        }
     }
 
-    private void startReceiverIfPaired() {
+        private void startReceiverIfPaired() {
         SharedPreferences prefs = MediaLibrary.prefs(this);
         if (!prefs.getString("remote_host", "").isEmpty()
                 && prefs.getString("remote_code", "").matches("[0-9]{8}")) {
@@ -333,77 +484,120 @@ public final class MainActivity extends Activity {
     private void refreshRemoteDevices() {
         if (refreshingDevices || !TransferService.serverRunning || targetsPanel == null) return;
         refreshingDevices = true;
-        new Thread(new Runnable() {
-            @Override public void run() {
-                JSONArray devices = new JSONArray();
-                try { devices = RemoteControlClient.devices(TransferService.accessCode); }
-                catch (Exception ignored) { }
-                final JSONArray found = devices;
-                runOnUiThread(new Runnable() {
-                    @Override public void run() {
-                        refreshingDevices = false;
-                        if (disposed || mode != 0 || targetsPanel == null) return;
-                        targetsPanel.removeAllViews();
-                        if (found.length() == 0) {
-                            targetsPanel.addView(text("Устройств пока нет. Открой Медиатеку на Huawei и подключи его к POCO.",
-                                    13, MUTED, false));
-                            return;
-                        }
-                        for (int i = 0; i < found.length(); i++) {
-                            JSONObject device = found.optJSONObject(i);
-                            if (device == null) continue;
-                            String id = device.optString("id", "");
-                            String label = device.optString("name", "Android");
-                            boolean active = chosenDevice.equals(id);
-                            LinearLayout row = row();
-                            row.addView(text((active ? "● " : "○ ") + label, 13,
-                                    active ? ACCENT : WHITE, true), new LinearLayout.LayoutParams(0, -2, 1));
-                            Button choose = button(active ? "Выбран" : "Выбрать", active);
-                            row.addView(choose, new LinearLayout.LayoutParams(dp(104), dp(43)));
-                            choose.setOnClickListener(v -> {
-                                chosenDevice = id;
-                                MediaLibrary.prefs(MainActivity.this).edit()
-                                        .putString("selected_remote_device", id).apply();
-                                nextDevicesAt = 0;
-                                render();
-                            });
-                            targetsPanel.addView(row);
-                        }
-                    }
-                });
-            }
-        }, "RemoteScreensRefresh").start();
+        new Thread(() -> {
+            JSONArray devices = new JSONArray();
+            try { devices = RemoteControlClient.devices(TransferService.accessCode); }
+            catch (Exception ignored) { }
+            final JSONArray found = devices;
+            runOnUiThread(() -> {
+                refreshingDevices = false;
+                if (disposed || mode != 0 || targetsPanel == null) return;
+                targetsPanel.removeAllViews();
+                if (found.length() == 0) {
+                    targetsPanel.addView(text("Пока нет подключённых экранов. Открой Медиатеку на Huawei и подключи его к POCO.",
+                            12, MUTED, false));
+                    return;
+                }
+                for (int i = 0; i < found.length(); i++) {
+                    JSONObject device = found.optJSONObject(i);
+                    if (device == null) continue;
+                    String id = device.optString("id", "");
+                    String label = device.optString("name", "Android");
+                    boolean active = chosenDevice.equals(id);
+                    if (active) deviceLabel = label;
+                    LinearLayout line = row();
+                    LinearLayout title = column();
+                    title.addView(text((active ? "● " : "○ ") + label, 14, active ? ACCENT : WHITE, true));
+                    title.addView(text(active ? "Выбран для воспроизведения" : "Доступен по локальному Wi-Fi",
+                            11, MUTED, false), spaced(4, 0));
+                    line.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+                    Button choose = button(active ? "✓" : "Выбрать", active);
+                    line.addView(choose, new LinearLayout.LayoutParams(dp(92), dp(44)));
+                    choose.setOnClickListener(v -> {
+                        chosenDevice = id;
+                        MediaLibrary.prefs(this).edit().putString("selected_remote_device", id).apply();
+                        nextDevicesAt = 0;
+                        render();
+                    });
+                    targetsPanel.addView(line, spaced(0, 9));
+                }
+            });
+        }, "MediaDevices").start();
     }
 
-    private void scanSenderEpisodes() {
-        new Thread(new Runnable() {
-            @Override public void run() {
-                final List<MediaLibrary.Film> available = MediaLibrary.scan(MainActivity.this);
-                runOnUiThread(new Runnable() {
-                    @Override public void run() {
-                        if (disposed || mode != 0 || remoteLibraryPanel == null) return;
-                        remoteLibraryPanel.removeAllViews();
-                        if (available.size() == 0) {
-                            remoteLibraryPanel.addView(text("Сначала добавь папку или серию.", 13, MUTED, false));
-                            return;
-                        }
-                        for (MediaLibrary.Film film : available) {
-                            LinearLayout line = row();
-                            TextView name = text(film.name, 13, WHITE, false);
-                            name.setMaxLines(2);
-                            line.addView(name, new LinearLayout.LayoutParams(0, -2, 1));
-                            Button play = button("▶", true);
-                            line.addView(play, new LinearLayout.LayoutParams(dp(51), dp(46)));
-                            play.setOnClickListener(v -> sendToRemote("play", film.id));
-                            remoteLibraryPanel.addView(line, spaced(0, 4));
-                        }
+        private void scanSenderEpisodes() {
+        final LinearLayout destination = remoteLibraryPanel;
+        final String currentCollection = openCollection;
+        new Thread(() -> {
+            final List<MediaLibrary.Film> available = MediaLibrary.scan(this);
+            runOnUiThread(() -> {
+                if (disposed || mode != 0 || page != 0 || destination != remoteLibraryPanel) return;
+                destination.removeAllViews();
+                if (available.isEmpty()) {
+                    destination.addView(text("Пока нет серий. Добавь папку с POCO во вкладке «Файлы».",
+                            13, MUTED, false));
+                    return;
+                }
+                if (currentCollection.isEmpty()) {
+                    java.util.Map<String, Integer> groups = new java.util.LinkedHashMap<>();
+                    for (MediaLibrary.Film f : available) {
+                        String group = collectionName(f.name);
+                        groups.put(group, groups.containsKey(group) ? groups.get(group) + 1 : 1);
                     }
-                });
-            }
-        }, "SenderEpisodeButtons").start();
+                    for (java.util.Map.Entry<String, Integer> pair : groups.entrySet()) {
+                        String title = pair.getKey();
+                        LinearLayout section = slimPanel();
+                        LinearLayout info = row();
+                        TextView icon = text("▱", 22, ACCENT, false);
+                        info.addView(icon, new LinearLayout.LayoutParams(dp(38), -2));
+                        LinearLayout labels = column();
+                        labels.addView(text(title, 14, WHITE, true));
+                        labels.addView(text(pair.getValue() + " видео", 11, MUTED, false), spaced(3, 0));
+                        info.addView(labels, new LinearLayout.LayoutParams(0, -2, 1));
+                        info.addView(text("›", 22, ACCENT, false));
+                        section.addView(info);
+                        section.setOnClickListener(v -> { openCollection = title; visibleItems = 60; render(); });
+                        destination.addView(section, spaced(0, 8));
+                    }
+                } else {
+                    TextView back = text("‹   Все сериалы", 13, ACCENT, true);
+                    back.setPadding(dp(3), dp(10), dp(3), dp(12));
+                    back.setOnClickListener(v -> { openCollection = ""; render(); });
+                    destination.addView(back);
+                    int displayed = 0;
+                    for (MediaLibrary.Film f : available) {
+                        if (!currentCollection.equals(collectionName(f.name))) continue;
+                        if (displayed++ >= visibleItems) continue;
+                        LinearLayout line = slimPanel();
+                        LinearLayout inner = row();
+                        LinearLayout info = column();
+                        TextView name = text(cleanFilename(f.name), 13, WHITE, true);
+                        name.setMaxLines(2);
+                        info.addView(name);
+                        info.addView(text(MediaLibrary.readableSize(f.size), 11, MUTED, false), spaced(3, 0));
+                        inner.addView(info, new LinearLayout.LayoutParams(0, -2, 1));
+                        Button play = button("▶", true);
+                        inner.addView(play, new LinearLayout.LayoutParams(dp(47), dp(44)));
+                        play.setOnClickListener(v -> sendToRemote("play", f.id));
+                        line.addView(inner);
+                        destination.addView(line, spaced(0, 6));
+                    }
+                    if (displayed > visibleItems) {
+                        Button more = button("Показать ещё", false);
+                        destination.addView(more, spaced(8, 8));
+                        more.setOnClickListener(v -> { visibleItems += 60; render(); });
+                    }
+                }
+            });
+        }, "LightCatalog").start();
     }
 
-    private void sendToRemote(final String action, final String fileId) {
+    private String cleanFilename(String filename) {
+        return filename.replaceAll("(?i)\\.(mp4|mkv|avi|webm|mov|m4v|ts|mpg|mpeg|3gp)$", "")
+                .replace('_', ' ').trim();
+    }
+
+        private void sendToRemote(final String action, final String fileId) {
         final String target = chosenDevice;
         final String code = TransferService.accessCode;
         if (target.isEmpty()) { toast("Сначала выбери устройство для просмотра"); return; }
@@ -456,173 +650,161 @@ public final class MainActivity extends Activity {
 
     private void showReceiver() {
         SharedPreferences prefs = MediaLibrary.prefs(this);
-        String host = prefs.getString("remote_host", "");
-        boolean remembered = !host.isEmpty() && prefs.getString("remote_code", "").matches("[0-9]{8}");
-        sectionTitle("Удалённое управление", "POCO может запускать серии и управлять плеером на этом устройстве.");
-        note("Чтобы POCO видел этот экран, оставь фоновую службу Медиатеки включённой.");
-        sectionTitle("Телефон", remembered ? "Подключение сохранено — повторный ввод не нужен." :
-                "Первый раз введи IP и код с экрана телефона.");
-        LinearLayout connection = panel();
-        linkStatus = text(remembered ? "Соединяюсь с телефоном..." : "Телефон ещё не подключён", 15,
-                remembered ? ACCENT : MUTED, true);
-        connection.addView(linkStatus);
-        if (remembered) {
-            TextView saved = text("Сохранён: " + host, 12, MUTED, false);
-            connection.addView(saved, spaced(7, 0));
-        }
-        content.addView(connection, spaced(0, 9));
-        if (!remembered) {
-            action("Подключить телефон", true, new View.OnClickListener() {
-                @Override public void onClick(View v) { showPairingDialog(); }
-            });
-        } else {
-            rowActions("Обновить серии", "Настройки",
-                    new View.OnClickListener() {
-                        @Override public void onClick(View v) { connectSaved(false); }
-                    }, new View.OnClickListener() {
-                        @Override public void onClick(View v) { showPairingDialog(); }
-                    });
-        }
-
-        sectionTitle("Куда сохранять", "Выбранная папка сохранится для следующих загрузок.");
+        boolean paired = !prefs.getString("remote_host", "").isEmpty()
+                && prefs.getString("remote_code", "").matches("[0-9]{8}");
         String tree = prefs.getString(MediaLibrary.DEST_TREE, "");
-        LinearLayout folder = panel();
-        folder.addView(text(tree.isEmpty() ? "○ Выбери папку на microSD" :
-                "✓ Папка для серий выбрана", 14, tree.isEmpty() ? MUTED : ACCENT, true));
-        content.addView(folder, spaced(0, 9));
-        action(tree.isEmpty() ? "Выбрать microSD" : "Изменить папку сохранения", false,
-                new View.OnClickListener() {
-                    @Override public void onClick(View v) {
-                        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
-                        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
-                        startActivityForResult(intent, PICK_SD_FOLDER);
-                    }
-                });
-
-        int waiting = DownloadQueue.waiting(this);
-        if (waiting > 0) {
-            LinearLayout queuePanel = panel();
-            queuePanel.addView(text("Очередь сохранена · " + waiting + " серий", 15, ACCENT, true));
-            queuePanel.addView(text(DownloadQueue.paused(this)
-                    ? "На паузе. Нажми «Скачать недостающие», чтобы продолжить."
-                    : "После подключения к POCO очередь продолжится автоматически.",
-                    12, MUTED, false), spaced(5, 0));
-            content.addView(queuePanel, spaced(8, 8));
-        }
-        sectionTitle("Доступные серии", remoteFiles.length() == 0 ?
-                "После подключения здесь появится библиотека телефона." :
-                "▶ — смотреть по Wi-Fi без скачивания; галочка — добавить в очередь.");
-        if (remoteFiles.length() > 0) {
-            int finished = 0;
-            int missing = 0;
+        if (page == 1) {
+            pageTitle("Телефон", "Соединение сохраняется после первого подключения");
+            LinearLayout connection = slimPanel();
+            linkStatus = text(paired ? statusMessage : "Телефон не подключён", 15,
+                    paired ? ACCENT : MUTED, true);
+            connection.addView(linkStatus);
+            if (paired) connection.addView(text("IP: " + prefs.getString("remote_host", ""),
+                    12, MUTED, false), spaced(7, 0));
+            content.addView(connection, spaced(0, 10));
+            action(paired ? "Обновить подключение" : "Подключить POCO", true,
+                    v -> { if (paired) connectSaved(false); else showPairingDialog(); });
+            action("Изменить IP и код", false, v -> showPairingDialog());
+            note("POCO и Huawei должны находиться в одной локальной Wi-Fi-сети.");
+        } else if (page == 2) {
+            pageTitle("Загрузки", "Сохранённые серии и очередь");
+            int done = 0;
             for (int i = 0; i < remoteFiles.length(); i++) {
-                JSONObject item = remoteFiles.optJSONObject(i);
-                if (item == null) continue;
-                if (DownloadQueue.DONE.equals(DownloadQueue.status(this, item.optString("id")))) finished++;
-                else missing++;
+                JSONObject e = remoteFiles.optJSONObject(i);
+                if (e != null && DownloadQueue.DONE.equals(DownloadQueue.status(this, e.optString("id")))) done++;
             }
-            note("На microSD: " + finished + " · Ещё не скачано: " + missing);
-            if (missing > 0) {
-                action("Скачать недостающие · " + missing, true, new View.OnClickListener() {
-                    @Override public void onClick(View v) { downloadAllMissing(); }
+            cardRow("✓", "Скачано: " + done, "Видео сохраняются на microSD", "", null);
+            cardRow("⇩", "В очереди: " + DownloadQueue.waiting(this),
+                    DownloadQueue.paused(this) ? "Приостановлено" : TransferService.progressText, "", null);
+            thinHeading("Папка загрузок", null, null);
+            cardRow("▱", tree.isEmpty() ? "Выбрать microSD" : "Папка выбрана",
+                    tree.isEmpty() ? "Нужна для сохранения серий" : "Нажми, чтобы изменить", "›", v -> destinationPicker());
+            action("Скачать все недостающие", true, v -> downloadAllMissing());
+            if (DownloadQueue.paused(this)) {
+                action("Продолжить очередь", false, v -> {
+                    DownloadQueue.setPaused(this, false);
+                    startQueueDownload(false);
+                    render();
                 });
             }
-            LinearLayout selection = row();
-            TextView summary = text(remoteFiles.length() + " файлов", 14, MUTED, false);
-            selection.addView(summary, new LinearLayout.LayoutParams(0, -2, 1));
-            linkInto(selection, "Выбрать все", new View.OnClickListener() {
-                @Override public void onClick(View v) { setAll(true); }
+            if (TransferService.downloading) action("Пауза", false, v -> {
+                TransferService.send(this, TransferService.PAUSE);
+                render();
             });
-            linkInto(selection, "Снять", new View.OnClickListener() {
-                @Override public void onClick(View v) { setAll(false); }
-            });
-            content.addView(selection, spaced(0, 10));
-            final Set<String> queuedIds = DownloadQueue.queuedIds(this);
-            LinearLayout listing = panel();
-            listing.setPadding(dp(7), dp(5), dp(7), dp(5));
-            for (int i = 0; i < remoteFiles.length(); i++) {
-                JSONObject episode = remoteFiles.optJSONObject(i);
-                if (episode == null) continue;
-                final String id = episode.optString("id");
-                CheckBox check = new CheckBox(this);
-                check.setTag(id);
-                String state = DownloadQueue.status(this, id);
-                boolean queued = queuedIds.contains(id);
-                if (DownloadQueue.DONE.equals(state)) chosen.remove(id);
-                String stateLabel = DownloadQueue.DONE.equals(state) ? "✓ Скачано на microSD"
-                        : queued ? "◷ В очереди"
-                        : DownloadQueue.PARTIAL.equals(state) ? "↻ Можно продолжить"
-                        : "Не скачано";
-                check.setText(episode.optString("name", "Серия") + "\n"
-                        + MediaLibrary.readableSize(episode.optLong("size", -1))
-                        + " · " + stateLabel);
-                check.setTextSize(13);
-                check.setTextColor(WHITE);
-                check.setPadding(dp(7), dp(7), dp(4), dp(7));
-                check.setButtonTintList(ColorStateList.valueOf(ACCENT));
-                check.setChecked(chosen.contains(id));
-                check.setEnabled(!DownloadQueue.DONE.equals(state) && !queued);
-                if (!check.isEnabled()) check.setTextColor(MUTED);
-                check.setOnCheckedChangeListener((b, selected) -> {
-                    if (selected) chosen.add(id); else chosen.remove(id);
-                    updateDownloadButton();
-                });
-                LinearLayout episodeRow = row();
-                episodeRow.addView(check, new LinearLayout.LayoutParams(0, -2, 1));
-                Button play = button("▶", false);
-                play.setContentDescription("Смотреть: " + episode.optString("name", "Серия"));
-                LinearLayout.LayoutParams playParams = new LinearLayout.LayoutParams(dp(46), dp(45));
-                playParams.leftMargin = dp(3);
-                episodeRow.addView(play, playParams);
-                play.setOnClickListener(new View.OnClickListener() {
-                    @Override public void onClick(View v) { openStream(id); }
-                });
-                listing.addView(episodeRow, new LinearLayout.LayoutParams(-1, -2));
-                episodeChecks.add(check);
-                if (i != remoteFiles.length() - 1) {
-                    View line = new View(this);
-                    line.setBackgroundColor(DIVIDER);
-                    listing.addView(line, new LinearLayout.LayoutParams(-1, dp(1)));
-                }
-            }
-            content.addView(listing);
+        } else if (page == 3) {
+            pageTitle("Настройки", "Ничего лишнего на главном экране");
+            roleSettings();
+            thinHeading("Подключение", null, null);
+            cardRow("▣", paired ? "POCO сохранён" : "POCO не настроен",
+                    "IP и код соединения", "›", v -> showPairingDialog());
+            thinHeading("Хранилище", null, null);
+            cardRow("▱", tree.isEmpty() ? "microSD не выбрана" : "microSD подключена",
+                    "Выбрать папку для фильмов", "›", v -> destinationPicker());
+            note("Очередь загрузок и уже скачанные серии сохраняются. Для обновления библиотеки открой «Телефон».");
         } else {
-            LinearLayout placeholder = panel();
-            placeholder.addView(text("Здесь появятся серии с POCO", 14, MUTED, false));
-            content.addView(placeholder);
+            pageTitle(openCollection.isEmpty() ? "Мои сериалы" : openCollection,
+                    openCollection.isEmpty() ? "Смотреть или скачать с POCO" : "Выбери нужную серию");
+            cardRow("▣", paired ? (linkConnected ? "POCO подключён" : "POCO — соединение сохранено") : "Подключить POCO",
+                    paired ? "Открыть управление соединением" : "Один раз введи IP и код", "›", v -> navigate(1));
+            if (remoteFiles.length() == 0) {
+                cardRow("▱", "Список пока пуст", "Подключись к телефону и обнови серии", "", null);
+                action(paired ? "Обновить сериалы" : "Подключить телефон", true,
+                        v -> { if (paired) connectSaved(false); else showPairingDialog(); });
+                return;
+            }
+            final Set<String> queued = DownloadQueue.queuedIds(this);
+            if (openCollection.isEmpty()) {
+                java.util.Map<String,Integer> groups = new java.util.LinkedHashMap<>();
+                for (int i = 0; i < remoteFiles.length(); i++) {
+                    JSONObject file = remoteFiles.optJSONObject(i);
+                    if (file == null) continue;
+                    String name = collectionName(file.optString("name"));
+                    groups.put(name, groups.containsKey(name) ? groups.get(name) + 1 : 1);
+                }
+                thinHeading(remoteFiles.length() + " видео", "Обновить", v -> connectSaved(false));
+                for (java.util.Map.Entry<String,Integer> entry : groups.entrySet()) {
+                    cardRow("▱", entry.getKey(), entry.getValue() + " видео", "›",
+                            v -> { openCollection = entry.getKey(); visibleItems = 60; render(); });
+                }
+            } else {
+                TextView back = text("‹   Все сериалы", 13, ACCENT, true);
+                back.setPadding(dp(4), dp(9), dp(4), dp(12));
+                back.setOnClickListener(v -> { openCollection = ""; render(); });
+                content.addView(back);
+                thinHeading("Серии", "Выбрать все", v -> setAll(true));
+                int visible = 0;
+                for (int i = 0; i < remoteFiles.length(); i++) {
+                    JSONObject episode = remoteFiles.optJSONObject(i);
+                    if (episode == null || !openCollection.equals(collectionName(episode.optString("name")))) continue;
+                    if (visible++ >= visibleItems) continue;
+                    final String id = episode.optString("id");
+                    String state = DownloadQueue.status(this, id);
+                    boolean waiting = queued.contains(id);
+                    boolean downloaded = DownloadQueue.DONE.equals(state);
+                    if (downloaded) chosen.remove(id);
+                    String stateLabel = downloaded ? "✓ Скачано" : waiting ? "◷ В очереди" :
+                            DownloadQueue.PARTIAL.equals(state) ? "↻ Продолжить" :
+                                    MediaLibrary.readableSize(episode.optLong("size", -1));
+                    LinearLayout card = slimPanel();
+                    LinearLayout line = row();
+                    CheckBox check = new CheckBox(this);
+                    check.setTag(id);
+                    check.setButtonTintList(ColorStateList.valueOf(ACCENT));
+                    check.setChecked(chosen.contains(id));
+                    check.setEnabled(!downloaded && !waiting);
+                    check.setOnCheckedChangeListener((b, selected) -> {
+                        if (selected) chosen.add(id); else chosen.remove(id);
+                        updateDownloadButton();
+                    });
+                    line.addView(check, new LinearLayout.LayoutParams(dp(38), dp(43)));
+                    LinearLayout texts = column();
+                    TextView name = text(cleanFilename(episode.optString("name", "Серия")), 13, WHITE, true);
+                    name.setMaxLines(2);
+                    texts.addView(name);
+                    texts.addView(text(stateLabel, 11, downloaded ? ACCENT : MUTED, false), spaced(4, 0));
+                    line.addView(texts, new LinearLayout.LayoutParams(0, -2, 1));
+                    Button play = button("▶", false);
+                    play.setTextColor(ACCENT);
+                    line.addView(play, new LinearLayout.LayoutParams(dp(47), dp(43)));
+                    play.setOnClickListener(v -> openStream(id));
+                    card.addView(line);
+                    content.addView(card, spaced(0, 6));
+                    episodeChecks.add(check);
+                }
+                if (visible > visibleItems) {
+                    action("Показать ещё", false, v -> { visibleItems += 60; render(); });
+                }
+                link("Снять выбор", v -> setAll(false));
+                cardRow("⇩", "Скачать все недостающие", "Сохранить на карту microSD", "›",
+                        v -> downloadAllMissing());
+            }
         }
     }
 
-    private void buildBottomBar(LinearLayout screen) {
+        private void buildBottomBar(LinearLayout screen) {
         LinearLayout bar = column();
-        bar.setBackgroundColor(PANEL);
-        bar.setPadding(dp(14), dp(6), dp(14), dp(10));
-        transferStatus = text(TransferService.progressText, 12, MUTED, false);
-        transferStatus.setMaxLines(2);
-        bar.addView(transferStatus, spaced(0, 6));
+        bar.setBackgroundColor(Color.rgb(10, 25, 35));
+        bar.setPadding(dp(13), dp(7), dp(13), dp(7));
+        transferStatus = text(TransferService.progressText, 11, MUTED, false);
+        transferStatus.setMaxLines(1);
+        transferStatus.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        bar.addView(transferStatus, spaced(0, 4));
         LinearLayout controls = row();
-        downloadButton = button("Скачать серии", true);
-        controls.addView(downloadButton, new LinearLayout.LayoutParams(0, dp(49), 1));
-        downloadButton.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { beginDownload(); }
-        });
-        pauseButton = button("Пауза", false);
-        LinearLayout.LayoutParams pauseParams = new LinearLayout.LayoutParams(dp(94), dp(49));
-        pauseParams.leftMargin = dp(8);
+        downloadButton = button("Скачать выбранные", true);
+        controls.addView(downloadButton, new LinearLayout.LayoutParams(0, dp(45), 1));
+        downloadButton.setOnClickListener(v -> beginDownload());
+        pauseButton = button("Ⅱ", false);
+        LinearLayout.LayoutParams pauseParams = new LinearLayout.LayoutParams(dp(49), dp(45));
+        pauseParams.leftMargin = dp(7);
         controls.addView(pauseButton, pauseParams);
         pauseButton.setVisibility(TransferService.downloading ? View.VISIBLE : View.GONE);
-        pauseButton.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) {
-                TransferService.send(MainActivity.this, TransferService.PAUSE);
-            }
-        });
+        pauseButton.setOnClickListener(v -> TransferService.send(this, TransferService.PAUSE));
         bar.addView(controls);
         updateDownloadButton();
         screen.addView(bar);
     }
 
-    private void updateDownloadButton() {
+        private void updateDownloadButton() {
         if (downloadButton == null) return;
         int selected = chosen.size();
         downloadButton.setText(selected == 0 ? "Выбери серии" :
@@ -756,6 +938,11 @@ public final class MainActivity extends Activity {
                             statusMessage = "Нет связи с POCO. Очередь сохранена — проверь Wi-Fi.";
                             if (!automatic && error != null) toast("Подключение: " + error.getMessage());
                             if (linkStatus != null) linkStatus.setText(statusMessage);
+            if (compactStatus != null) {
+                boolean active = mode == 0 ? TransferService.serverRunning : linkConnected;
+                compactStatus.setText(active ? "●  Подключено" : "○  Не подключено");
+                compactStatus.setTextColor(active ? ACCENT : MUTED);
+            }
                         }
                     }
                 });
