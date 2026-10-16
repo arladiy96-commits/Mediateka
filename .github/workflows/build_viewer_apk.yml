@@ -103,21 +103,21 @@ jobs:
 
           if [[ "$MODE" == "release" ]]; then
             SOURCE_APK='viewer/build/outputs/apk/release/viewer-release.apk'
-            RELEASE_NOTES='Android APK signed with the repository release key. Installable on Android 7+. Only manual Run workflow.'
+            RELEASE_NOTES='ДЛЯ HUAWEI / ТВ-ПРИСТАВКИ / МАГНИТОЛЫ. Просмотр, скачивание на microSD, плеер, приём команд от POCO. НЕ устанавливать на телефон-раздатчик. Android 7+. Подписано постоянным ключом GitHub Secrets. Только ручная сборка.'
             EXTRA=()
           else
             SOURCE_APK='viewer/build/outputs/apk/debug/viewer-debug.apk'
-            RELEASE_NOTES='Test build (debug-signed). Installable on Android 7+. Only manual Run workflow. For in-place updates without data loss, configure a permanent release signing key.'
+            RELEASE_NOTES='ДЛЯ HUAWEI / ТВ-ПРИСТАВКИ / МАГНИТОЛЫ. Просмотр, скачивание на microSD, плеер, приём команд от POCO. НЕ устанавливать на телефон-раздатчик. Android 7+. Тестовая DEBUG-подпись: обновление поверх предыдущей версии может быть невозможно. Для обновлений без потери данных нужен постоянный ключ. Только ручная сборка.'
             EXTRA=(--prerelease)
           fi
 
           [[ -s "$SOURCE_APK" ]] || { echo "::error::APK missing: $SOURCE_APK"; exit 1; }
-          cp "$SOURCE_APK" dist/Mediateka-Viewer.apk
-          sha256sum dist/Mediateka-Viewer.apk
+          cp "$SOURCE_APK" dist/EKRAN-Mediateka.apk
+          sha256sum dist/EKRAN-Mediateka.apk
 
-          gh release create "$TAG" dist/Mediateka-Viewer.apk \
+          gh release create "$TAG" dist/EKRAN-Mediateka.apk \
             --target "$GITHUB_SHA" \
-            --title "Медиатека · Экран $TAG" \
+            --title "📺 ЭКРАН — Huawei / ТВ / Магнитола | $TAG" \
             --notes "$RELEASE_NOTES" \
             "${EXTRA[@]}"
 
@@ -125,6 +125,6 @@ jobs:
             echo "### APK published to GitHub Releases"
             echo "- Tag: $TAG"
             echo "- Signing mode: $MODE"
-            echo "- APK asset: Mediateka-Viewer.apk"
+            echo "- APK asset: EKRAN-Mediateka.apk"
             echo "- Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
           } >> "$GITHUB_STEP_SUMMARY"
