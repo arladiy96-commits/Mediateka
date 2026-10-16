@@ -1,0 +1,43 @@
+plugins {
+    id 'com.android.application'
+}
+
+def buildNum = providers.gradleProperty('buildNumber').orElse('1').get().toInteger()
+def keyFile = System.getenv('ANDROID_KEYSTORE_FILE')
+def keyStorePassword = System.getenv('ANDROID_KEYSTORE_PASSWORD')
+def keyAliasName = System.getenv('ANDROID_KEY_ALIAS')
+def keyPasswordValue = System.getenv('ANDROID_KEY_PASSWORD')
+def hasSigning = keyFile && keyStorePassword && keyAliasName && keyPasswordValue
+
+android {
+    namespace 'com.serialtransfer.app'
+    compileSdk 35
+    defaultConfig {
+        // Different from POCO app, both can be installed simultaneously.
+        applicationId 'com.serialtransfer.viewer'
+        minSdk 24
+        targetSdk 32
+        versionCode = buildNum
+        versionName = "8.0.${buildNum}"
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    signingConfigs {
+        if (hasSigning) {
+            release {
+                storeFile file(keyFile)
+                storePassword keyStorePassword
+                keyAlias keyAliasName
+                keyPassword keyPasswordValue
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (hasSigning) signingConfig signingConfigs.release
+        }
+    }
+}
