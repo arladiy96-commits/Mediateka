@@ -106,6 +106,16 @@ public final class MainActivity extends Activity {
     private SeekBar remoteSeek;
     private TextView remoteNow;
     private TextView remotePlaying;
+    // Smooth local clock between actual playback reports from the viewer.
+    // elapsedRealtime is monotonic and unaffected by changes to wall clock time.
+    private int remoteReportedPositionMs;
+    private int remoteReportedDurationMs;
+    private long remoteReportedAtMs;
+    private boolean remoteReportedPlaying;
+    private boolean remoteScrubbing;
+    private String remoteReportedDevice = "";
+    private long optimisticSeekUntilMs;
+    private int optimisticSeekPositionMs;
     private long nextCatalogCheck;
     private boolean diagnosticsRunning;
     private final List<CheckBox> episodeChecks = new ArrayList<>();
@@ -170,12 +180,14 @@ public final class MainActivity extends Activity {
                 nextReconnectAt = now + (linkConnected ? 75000 : 18000);
                 connectSaved(true); // refresh catalogue and recover even with an empty download queue
             }
+            if (mode == 0 && page == 2) tickRemoteClock(now);
             if (mode == 0 && TransferService.serverRunning && targetsPanel != null
                     && now >= nextDevicesAt && !refreshingDevices) {
-                nextDevicesAt = now + 9000;
+                // Poll the POCO remote screen more often than the devices directory.
+                nextDevicesAt = now + (page == 2 ? 1700 : 6500);
                 refreshRemoteDevices();
             }
-            handler.postDelayed(this, 900);
+            handler.postDelayed(this, mode == 0 && page == 2 ? 250 : 900);
         }
     };
 
@@ -792,12 +804,23 @@ public final class MainActivity extends Activity {
         remoteSeek.setProgressTintList(ColorStateList.valueOf(POCO_CYAN));
         remoteSeek.setThumbTintList(ColorStateList.valueOf(POCO_CYAN));
         remoteSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override public void onStartTrackingTouch(SeekBar bar) {}
-            @Override public void onProgressChanged(SeekBar bar,int v,boolean byUser) {}
+            @Override public void onStartTrackingTouch(SeekBar bar) { remoteScrubbing = true; }
+            @Override public void onProgressChanged(SeekBar bar, int value, boolean byUser) {
+                if (!byUser || remoteNow == null || remoteReportedDurationMs <= 0) return;
+                int previewMs = (int) ((long) value * remoteReportedDurationMs / 1000L);
+                // Preview the destination immediately, without any network round trip.
+                remoteNow.setText(clock(previewMs) + " / " + clock(remoteReportedDurationMs));
+            }
             @Override public void onStopTrackingTouch(SeekBar bar) {
-                int duration=MediaLibrary.prefs(MainActivity.this)
-                        .getInt("remote_duration_v7_"+chosenDevice,0);
-                if(duration>0)seekRemote((int)((long)bar.getProgress()*duration/1000L));
+                remoteScrubbing = false;
+                if (remoteReportedDurationMs <= 0) return;
+                int wanted = (int) ((long) bar.getProgress() * remoteReportedDurationMs / 1000L);
+                remoteReportedPositionMs = wanted;
+                remoteReportedAtMs = android.os.SystemClock.elapsedRealtime();
+                optimisticSeekPositionMs = wanted;
+                optimisticSeekUntilMs = remoteReportedAtMs + 6500L;
+                tickRemoteClock(remoteReportedAtMs);
+                seekRemote(wanted);
             }
         });
         hero.addView(remoteSeek);
@@ -1210,25 +1233,54 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private void tickRemoteClock(long now) {
+        if (remoteReportedAtMs <= 0 || remoteSeek == null || remoteNow == null) return;
+        if (remoteScrubbing || remoteSeek.isPressed()) return;
+        long ageMs = Math.max(0, now - remoteReportedAtMs);
+        // Do not keep pretending video is playing if no reports arrive for a while.
+        long elapsed = remoteReportedPlaying ? Math.min(ageMs, 6000L) : 0;
+        long current = Math.max(0L, (long) remoteReportedPositionMs + elapsed);
+        if (remoteReportedDurationMs > 0) current = Math.min(current, remoteReportedDurationMs);
+        remoteNow.setText(clock((int) current) + " / " + clock(remoteReportedDurationMs));
+        if (remoteReportedDurationMs > 0) {
+            remoteSeek.setProgress((int) Math.min(1000L, current * 1000L / remoteReportedDurationMs));
+        }
+    }
+
     private void updateRemoteProgress(JSONObject state) {
         String id = state.optString("player_id", "");
-        int current = state.optInt("position", 0);
-        int duration = state.optInt("duration", 0);
+        int current = Math.max(0, state.optInt("position", 0));
+        int duration = Math.max(0, state.optInt("duration", 0));
         boolean playing = state.optBoolean("playing", false);
+        if (!chosenDevice.equals(remoteReportedDevice)) {
+            remoteReportedDevice = chosenDevice;
+            remoteReportedPositionMs = 0;
+            remoteReportedAtMs = 0;
+        }
+        long receivedAt = android.os.SystemClock.elapsedRealtime();
+        // A sample captured before the new seek reached Huawei must not jerk the
+        // thumb back to the old position while the command is in flight.
+        if (optimisticSeekUntilMs > receivedAt && id.matches("[0-9a-f]{24}")
+                && Math.abs((long) current - optimisticSeekPositionMs) > 3500L) {
+            current = optimisticSeekPositionMs;
+        } else {
+            optimisticSeekUntilMs = 0L;
+        }
+        remoteReportedPositionMs = current;
+        remoteReportedDurationMs = duration;
+        remoteReportedPlaying = playing;
+        remoteReportedAtMs = receivedAt;
         MediaLibrary.prefs(this).edit().putInt("remote_duration_v7_" + chosenDevice, duration).apply();
         pocoIsPlaying = playing;
         if (pocoBigPlay != null) pocoBigPlay.setText(playing ? "Ⅱ" : "▶");
         if (remotePlaying != null) {
             String name = "Нет активного просмотра";
             if (id.matches("[0-9a-f]{24}")) {
-                name = id;
                 name = state.optString("player_name", "Серия воспроизводится");
             }
             remotePlaying.setText((playing ? "▶ " : "Ⅱ ") + name);
         }
-        if (remoteNow != null) remoteNow.setText(clock(current) + " / " + clock(duration));
-        if (remoteSeek != null && duration > 0 && !remoteSeek.isPressed())
-            remoteSeek.setProgress((int)Math.min(1000, ((long)current * 1000L / duration)));
+        tickRemoteClock(remoteReportedAtMs);
     }
 
     private void refreshRemoteDevices() {
@@ -1242,6 +1294,18 @@ public final class MainActivity extends Activity {
             runOnUiThread(() -> {
                 refreshingDevices = false;
                 if (disposed || mode != 0 || targetsPanel == null) return;
+                // Remote tab only needs current playback state; don't rebuild an invisible
+                // list of cards every two seconds on the UI thread.
+                if (page == 2) {
+                    for (int i = 0; i < found.length(); i++) {
+                        JSONObject device = found.optJSONObject(i);
+                        if (device != null && chosenDevice.equals(device.optString("id", ""))) {
+                            updateRemoteProgress(device);
+                            break;
+                        }
+                    }
+                    return;
+                }
                 targetsPanel.removeAllViews();
                 if (found.length() == 0) {
                     targetsPanel.addView(text("Пока нет подключённых экранов. Открой Медиатеку на Huawei и подключи его к POCO.",
