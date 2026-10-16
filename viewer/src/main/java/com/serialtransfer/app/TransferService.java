@@ -66,11 +66,13 @@ public final class TransferService extends Service {
         receiverRunning=true;
         receiverThread=new Thread(()->{
             while(receiverRunning){
+                boolean reachable = false;
                 try {
                     String ip=MediaLibrary.prefs(this).getString("remote_host","");
                     String code=MediaLibrary.prefs(this).getString("remote_code","");
                     if(!ip.isEmpty()) {
                         JSONObject command=RemoteControlClient.poll(this,ip,code);
+                        reachable = true;
                         if(!"none".equals(command.optString("action","none"))){
                             if("play".equals(command.optString("action"))){
                                 try {
@@ -103,7 +105,9 @@ public final class TransferService extends Service {
                     if(now-lastDiscovery>20000){lastDiscovery=now;
                         discover(MediaLibrary.prefs(this).getString("remote_code",""));}
                 }
-                try{Thread.sleep(3500);}catch(InterruptedException stop){break;}
+                // A small command response allows launching video promptly while the app
+                // is minimized. Save CPU/network work if POCO is not reachable.
+                try{Thread.sleep(reachable ? 1700 : 4500);}catch(InterruptedException stop){break;}
             }
         },"MediatekaViewerRemote");
         receiverThread.setDaemon(true);receiverThread.start();
