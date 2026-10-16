@@ -153,7 +153,9 @@ public final class MainActivity extends Activity {
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
         SharedPreferences prefs = MediaLibrary.prefs(this);
-        mode = prefs.getInt("screen", 0);
+        // POCO/controller build: keep existing package and stored sender library.
+        mode = 0;
+        prefs.edit().putInt("screen", 0).apply();
         page = 0;
         chosenDevice = prefs.getString("selected_remote_device", "");
         try { remoteFiles = new JSONArray(prefs.getString("remote_cache", "[]")); }
@@ -355,13 +357,9 @@ public final class MainActivity extends Activity {
     }
 
     private void roleSettings() {
-        thinHeading("Устройство", null, null);
-        cardRow("▣", "Режим: " + (mode == 0 ? "Телефон" : "Планшет"),
-                "Переключить роль этого устройства", "›", v -> {
-                    new AlertDialog.Builder(this).setTitle("Режим устройства")
-                            .setItems(new String[]{"Телефон — раздача", "Планшет — просмотр"},
-                                    (d, which) -> chooseMode(which)).show();
-                });
+        thinHeading("Роль приложения", null, null);
+        cardRow("▣", "POCO · сервер и пульт",
+                "Для просмотра установи отдельное APK «Медиатека — Экран»", "✓", null);
     }
 
     private void sourceFolderPicker() {
