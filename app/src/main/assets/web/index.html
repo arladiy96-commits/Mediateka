@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Медиатека · Просмотр</title>
+<style>
+:root{color-scheme:dark;--bg:#020d18;--surface:#0a1f2d;--edge:#1b4456;--accent:#06ddf5;--text:#ebf9ff;--muted:#84a3b8}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:1.5}
+button,input{font:inherit}button{cursor:pointer;color:inherit}button:focus,input:focus{outline:3px solid var(--accent);outline-offset:3px}
+.wrap{max-width:1250px;margin:0 auto;padding:24px 32px 64px}.top{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:28px}
+.brand{font-size:26px;font-weight:800;letter-spacing:.02em}.brand b{color:var(--accent)}.muted{color:var(--muted)}
+.pill{background:var(--surface);color:var(--accent);padding:7px 12px;border:1px solid var(--edge);border-radius:20px;font-size:14px}
+.card{border:1px solid var(--edge);background:var(--surface);border-radius:16px;padding:18px;text-align:left;transition:background .15s,border-color .15s;display:block;min-width:0}
+.card:focus,.card:hover{background:#103448;border-color:var(--accent)}.card-title{font-size:17px;font-weight:700;word-break:break-word}.card-meta{font-size:13px;color:var(--muted);margin-top:8px}
+.tileIcon{display:block;color:var(--accent);font-size:28px;margin-bottom:15px}
+.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.episodeGrid{grid-template-columns:repeat(3,minmax(0,1fr))}
+.bar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:16px;margin-bottom:20px}
+.search{width:340px;max-width:100%;background:#092332;border:1px solid var(--edge);color:var(--text);padding:12px 15px;border-radius:12px}
+.h1{font-size:25px;font-weight:700}.btn{background:#082f40;border:1px solid var(--edge);padding:11px 16px;border-radius:11px;font-weight:600}.btn-primary{background:#067e9e;border-color:#06abc6;color:white}
+#login{max-width:480px;margin:12vh auto 0;padding:32px;border:1px solid var(--edge);border-radius:20px;background:var(--surface)}
+#login h1{margin:0 0 8px;font-size:27px}#login p{color:var(--muted);margin:0 0 25px}#code{width:100%;background:#071723;color:var(--text);border:1px solid var(--edge);padding:14px;border-radius:10px;font-size:23px;letter-spacing:.2em;text-align:center;margin-bottom:12px}
+#loginButton{width:100%;padding:13px}#error{min-height:28px;color:#ffab9b;margin-top:14px}
+#library{display:none}#nowPlaying{display:none}#login.hidden{display:none}
+.empty{color:var(--muted);padding:25px 4px}.small{font-size:13px}.footer{margin-top:35px;font-size:12px;color:var(--muted)}
+#playerOverlay{display:none;position:fixed;inset:0;background:#000;z-index:100;overflow:auto}
+#playerFrame{display:flex;flex-direction:column;width:100%;height:100%;min-height:320px}
+#playerBar{display:flex;align-items:center;justify-content:space-between;gap:12px;background:rgba(5,19,29,.96);padding:13px 21px}
+#playerName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px;font-weight:700}
+#player{display:block;flex:1;width:100%;min-height:0;background:#000;outline:none}
+@media(max-width:900px){.grid{grid-template-columns:repeat(3,minmax(0,1fr))}.episodeGrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:600px){.wrap{padding:18px 16px 40px}.top{margin-bottom:20px}.brand{font-size:21px}.grid,.episodeGrid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.card{padding:13px}.card-title{font-size:14px}.bar{align-items:stretch}.search{width:100%}#login{margin:7vh 16px 0;padding:22px}.h1{font-size:22px}}
+</style>
+</head>
+<body>
+<section id="login">
+  <h1>Медиатека <span style="color:var(--accent)">●</span></h1>
+  <p>Просмотр с телефона по локальному Wi-Fi. Установка приложения на телевизор не нужна.</p>
+  <label for="code" class="small muted">Код подключения с телефона</label>
+  <input id="code" type="password" inputmode="numeric" autocomplete="off" maxlength="8" placeholder="••••••••">
+  <button id="loginButton" class="btn btn-primary" type="button">Открыть библиотеку</button>
+  <div id="error" role="status"></div>
+</section>
+<main id="library" class="wrap">
+  <div class="top"><div class="brand">МЕДИА<b>ТЕКА</b></div><button class="btn" type="button" id="logout">Выйти</button></div>
+  <div class="bar"><div><div class="h1" id="heading">Моя библиотека</div><div class="muted small" id="subheading">Фильмы и сериалы с телефона</div></div><input class="search" id="search" placeholder="Поиск по названию" aria-label="Поиск по названию"></div>
+  <div id="backHolder"></div><div id="content" class="grid"></div>
+  <div class="footer">Воспроизведение идёт прямо с телефона. Совместимость видео и звука зависит от браузера телевизора.</div>
+</main>
+<section id="playerOverlay" aria-label="Видеоплеер">
+  <div id="playerFrame"><div id="playerBar"><button id="closePlayer" type="button" class="btn">‹ Назад к фильмам</button><div id="playerName"></div></div><video id="player" controls playsinline preload="metadata"></video></div>
+</section>
+<script>
+(function(){
+'use strict';
+var code='',ticket='',films=[],selectedGroup='',playingId='';
+function el(id){return document.getElementById(id)}
+function req(path,key,done){
+  var xhr=new XMLHttpRequest();
+  xhr.open('GET',path,true);
+  if(key){xhr.setRequestHeader('X-Media-Key',key)}
+  xhr.onreadystatechange=function(){if(xhr.readyState===4)done(xhr.status,xhr.responseText)};
+  xhr.onerror=function(){done(0,'')};
+  xhr.send();
+}
+function showLogin(message){
+  closePlayer();ticket='';code='';films=[];selectedGroup='';
+  el('library').style.display='none';el('login').className='';
+  el('error').textContent=message||'';el('code').value='';el('code').focus();
+}
+function login(){
+  var entered=el('code').value.replace(/\s/g,'');
+  if(!/^[0-9]{8}$/.test(entered)){el('error').textContent='Введи 8 цифр с экрана телефона';return}
+  el('loginButton').disabled=true;el('error').textContent='Подключаюсь…';
+  req('/web/list',entered,function(status,body){
+    el('loginButton').disabled=false;
+    if(status!==200){el('error').textContent=status===403?'Неверный код или доступ выключен':'Нет соединения с Медиатекой';return}
+    try{
+      var result=JSON.parse(body);
+      if(!result.stream_ticket || !result.files || typeof result.files.length!=='number')throw new Error('invalid');
+      code=entered;ticket=result.stream_ticket;films=result.files;
+      el('login').className='hidden';el('library').style.display='block';
+      el('search').value='';render();
+    }catch(err){el('error').textContent='Не удалось прочитать список фильмов'}
+  });
+}
+function clean(name){return String(name||'').replace(/\.(mp4|mkv|avi|webm|mov|m4v|ts|mpg|mpeg|3gp)$/i,'').replace(/_/g,' ').trim()}
+function groupOf(name){
+ var raw=String(name||'').replace(/_/g,' ').replace(/\./g,' ').trim();
+ var match=/(?:^|\s)(?:[0-9]{1,2}\s*сезон|сезон\s*[0-9]{1,2}|s[0-9]{1,2}e[0-9]{1,3}|[0-9]{1,3}\s*серия|серия\s*[0-9]{1,3})(?=\s|$)/i.exec(raw);
+ if(match && match.index>0){var name=raw.substring(0,match.index).replace(/[-\s]+$/,'').trim();if(name)return name}
+ return 'Другие видео';
+}
+function humanSize(size){
+ if(size===undefined||size===null||size<0)return '';
+ if(size<1048576)return Math.round(size/1024)+' КБ';
+ if(size<1073741824)return (size/1048576).toFixed(1)+' МБ';
+ return (size/1073741824).toFixed(2)+' ГБ';
+}
+function make(tag,className,text){var x=document.createElement(tag);if(className)x.className=className;if(text!==undefined)x.textContent=text;return x}
+function clear(node){while(node.firstChild)node.removeChild(node.firstChild)}
+function addCard(parent,title,meta,symbol,action){
+ var b=make('button','card');b.type='button';b.appendChild(make('span','tileIcon',symbol));
+ b.appendChild(make('div','card-title',title));b.appendChild(make('div','card-meta',meta));
+ b.onclick=action;parent.appendChild(b);return b;
+}
+function render(){
+ var q=el('search').value.toLowerCase().trim(),holder=el('content'),back=el('backHolder');
+ clear(holder);clear(back);holder.className='grid'+(selectedGroup?' episodeGrid':'');
+ if(selectedGroup){
+   var b=make('button','btn','‹ Все сериалы');b.style.marginBottom='20px';b.onclick=function(){selectedGroup='';el('search').value='';render()};back.appendChild(b);
+   el('heading').textContent=selectedGroup;
+   var count=0;
+   films.forEach(function(f){if(groupOf(f.name)!==selectedGroup || clean(f.name).toLowerCase().indexOf(q)===-1)return;
+     count++;addCard(holder,clean(f.name),humanSize(f.size),'▶',function(){play(f)})});
+   el('subheading').textContent=count+' видео';
+   if(count===0)holder.appendChild(make('div','empty','Ничего не найдено'));
+ }else if(q){
+   el('heading').textContent='Результаты поиска';var found=0;
+   films.forEach(function(f){if(clean(f.name).toLowerCase().indexOf(q)===-1)return;
+     found++;addCard(holder,clean(f.name),groupOf(f.name),'▶',function(){play(f)})});
+   el('subheading').textContent=found+' видео';
+   if(!found)holder.appendChild(make('div','empty','Ничего не найдено'));
+ }else{
+   el('heading').textContent='Моя библиотека';el('subheading').textContent=films.length+' видео на телефоне';
+   var groups={};var keys=[];
+   films.forEach(function(f){var k=groupOf(f.name);if(!Object.prototype.hasOwnProperty.call(groups,k)){groups[k]=0;keys.push(k)}groups[k]++});
+   keys.forEach(function(k){addCard(holder,k,groups[k]+' видео','▱',function(){selectedGroup=k;render();window.scrollTo(0,0)})});
+   if(!keys.length)holder.appendChild(make('div','empty','Библиотека пуста. Добавь фильмы на телефоне.'));
+ }
+}
+function play(f){
+ if(!f || !/^[0-9a-f]{24}$/.test(f.id)){return}
+ playingId=f.id;
+ var video=el('player');video.pause();video.removeAttribute('src');video.load();
+ el('playerName').textContent=clean(f.name);
+ el('playerOverlay').style.display='block';
+ video.src='/web/stream?id='+encodeURIComponent(f.id)+'&ticket='+encodeURIComponent(ticket);
+ video.load();var p=video.play();if(p&&p.catch){p.catch(function(){})}
+ el('closePlayer').focus();
+}
+function closePlayer(){
+ el('playerOverlay').style.display='none';
+ var video=el('player');video.pause();video.removeAttribute('src');video.load();playingId='';
+}
+el('loginButton').onclick=login;
+el('code').onkeydown=function(e){e=e||window.event;if(e.key==='Enter'||e.keyCode===13)login()};
+el('logout').onclick=function(){showLogin('')};
+el('search').oninput=render;
+el('closePlayer').onclick=closePlayer;
+el('player').onerror=function(){if(playingId){el('playerName').textContent='Не удалось воспроизвести: браузер может не поддерживать кодек видео или звука'}};
+document.onkeydown=function(e){e=e||window.event;var key=e.key||'';
+ if((key==='Escape'||key==='Backspace')&&el('playerOverlay').style.display==='block'){
+   e.preventDefault();closePlayer();return}
+ // On older TV remotes, directional keys have no native focus travel.
+ if(key!=='ArrowLeft'&&key!=='ArrowRight'&&key!=='ArrowUp'&&key!=='ArrowDown')return;
+ if(el('library').style.display!=='block'||el('playerOverlay').style.display==='block')return;
+ var target=document.activeElement;if(target&&target.tagName==='INPUT')return;
+ var controls=el('library').querySelectorAll('button,input'),bounds=target&&target.getBoundingClientRect?target.getBoundingClientRect():null;
+ if(!bounds)return;
+ var x=bounds.left+bounds.width/2,y=bounds.top+bounds.height/2,best=null,score=1e10;
+ for(var i=0;i<controls.length;i++){
+   var c=controls[i];if(c===target)continue;
+   var r=c.getBoundingClientRect(),dx=r.left+r.width/2-x,dy=r.top+r.height/2-y;
+   if(key==='ArrowRight'&&dx<=10||key==='ArrowLeft'&&dx>=-10||key==='ArrowDown'&&dy<=10||key==='ArrowUp'&&dy>=-10)continue;
+   var primary=(key==='ArrowLeft'||key==='ArrowRight')?Math.abs(dx):Math.abs(dy);
+   var secondary=(key==='ArrowLeft'||key==='ArrowRight')?Math.abs(dy):Math.abs(dx);
+   var next=primary+secondary*2;if(next<score){score=next;best=c}
+ }
+ if(best){e.preventDefault();best.focus();best.scrollIntoView({block:'nearest'})}
+};
+el('code').focus();
+})();
+</script>
+</body>
+</html>
