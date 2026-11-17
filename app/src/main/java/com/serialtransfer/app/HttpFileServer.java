@@ -45,6 +45,7 @@ final class HttpFileServer {
     private final String code;
     // Streaming tickets change on every server start and do not grant list/download access.
     private final String streamTicket;
+    private final String browserTicket;
     private volatile boolean running;
     private final Map<String, Peer> peers = new ConcurrentHashMap<>();
 
@@ -110,6 +111,11 @@ final class HttpFileServer {
         StringBuilder token = new StringBuilder(48);
         for (byte b : random) token.append(String.format(Locale.US, "%02x", b & 255));
         streamTicket = token.toString();
+        byte[] browserRandom = new byte[24];
+        new SecureRandom().nextBytes(browserRandom);
+        StringBuilder browserToken = new StringBuilder(48);
+        for (byte b : browserRandom) browserToken.append(String.format(Locale.US, "%02x", b & 255));
+        browserTicket = browserToken.toString();
         updateLibrary(files);
     }
 
@@ -176,6 +182,45 @@ final class HttpFileServer {
             int q = rawPath.indexOf('?');
             String path = q < 0 ? rawPath : rawPath.substring(0, q);
             String query = q < 0 ? "" : rawPath.substring(q + 1);
+
+            // Optional browser interface. Kept separate from /list, /stream and
+            // all /remote/* endpoints consumed by the existing viewer APK.
+            if ("/web".equals(path) || "/web/".equals(path)) {
+                if (!browserEnabled()) { respond(out, 404, "Browser access disabled", head); return; }
+                byte[] page;
+                try (InputStream asset = appContext.getAssets().open("web/index.html")) {
+                    java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
+                    byte[] chunk = new byte[8192];
+                    int n;
+                    while ((n = asset.read(chunk)) != -1) buffer.write(chunk, 0, n);
+                    page = buffer.toByteArray();
+                }
+                sendBrowserPage(out, page, head);
+                return;
+            }
+            if ("/web/list".equals(path)) {
+                if (!browserEnabled()) { respond(out, 403, "Browser access disabled", head); return; }
+                if (head) { respond(out, 405, "GET only", true); return; }
+                if (!code.equals(providedCode)) { respond(out, 403, "Wrong pairing code", false); return; }
+                JSONObject data = new JSONObject();
+                data.put("protocol", 2);
+                data.put("stream_ticket", browserTicket);
+                JSONArray entries = new JSONArray();
+                for (MediaLibrary.Film item : byId.values()) entries.put(item.asJson());
+                data.put("files", entries);
+                respondJson(out, data.toString());
+                return;
+            }
+            if ("/web/stream".equals(path)) {
+                if (!browserEnabled()) { respond(out, 403, "Browser access disabled", head); return; }
+                if (!browserTicketMatches(queryParam(query, "ticket"))) {
+                    respond(out, 403, "Browser ticket invalid", head); return;
+                }
+                MediaLibrary.Film film = byId.get(queryParam(query, "id"));
+                if (film == null) { respond(out, 404, "File missing", head); return; }
+                sendMedia(out, film, range, head, mimeFor(film.name));
+                return;
+            }
 
             if ("/stream".equals(path)) {
                 // Third-party video players cannot provide custom HTTP pairing headers.
@@ -327,6 +372,28 @@ final class HttpFileServer {
             }
             editor.apply();
         } catch (Exception ignored) { /* An old client may not send watch information. */ }
+    }
+
+    private boolean browserEnabled() {
+        return MediaLibrary.prefs(appContext).getBoolean("browser_enabled", false);
+    }
+
+    private boolean browserTicketMatches(String submitted) {
+        if (submitted == null || submitted.length() != browserTicket.length()) return false;
+        return MessageDigest.isEqual(browserTicket.getBytes(StandardCharsets.US_ASCII),
+                submitted.getBytes(StandardCharsets.US_ASCII));
+    }
+
+    private static void sendBrowserPage(OutputStream out, byte[] page, boolean head) throws Exception {
+        String header = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+                + "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
+                + "Content-Security-Policy: default-src 'self'; style-src 'unsafe-inline';"
+                + " script-src 'unsafe-inline'; media-src 'self'; object-src 'none';"
+                + " base-uri 'none'; frame-ancestors 'none'\r\n"
+                + "Content-Length: " + page.length + "\r\nConnection: close\r\n\r\n";
+        out.write(header.getBytes(StandardCharsets.US_ASCII));
+        if (!head) out.write(page);
+        out.flush();
     }
 
     private boolean ticketMatches(String submitted) {

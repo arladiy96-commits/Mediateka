@@ -98,6 +98,7 @@ public final class MainActivity extends Activity {
     private volatile boolean refreshingDevices;
     private final ExecutorService actions = Executors.newSingleThreadExecutor();
     private TextView hostInfo;
+    private TextView browserStatus;
     private TextView compactStatus;
     private TextView linkStatus;
     private TextView transferStatus;
@@ -149,6 +150,13 @@ public final class MainActivity extends Activity {
                     hostInfo.setText("○ Раздача выключена\nНажми «Включить раздачу»");
                     hostInfo.setTextColor(MUTED);
                 }
+            }
+            if (browserStatus != null && mode == 0) {
+                browserStatus.setText(TransferService.serverRunning
+                        && !TransferService.serverIp.isEmpty()
+                        ? "Адрес для телевизора: http://" + TransferService.serverIp + ":"
+                            + HttpFileServer.PORT + "/web"
+                        : "Раздача выключена или IP пока не определён. Подключи Wi-Fi.");
             }
             if (linkStatus != null) linkStatus.setText(statusMessage);
             if (compactStatus != null) {
@@ -895,6 +903,41 @@ public final class MainActivity extends Activity {
             TransferService.send(this,TransferService.STOP_SERVER);
         }),off);
         server.addView(actions,pocoSpace(4,0));
+        // Browser access is opt-in. The existing viewer continues using the
+        // same server and routes regardless of this setting.
+        boolean browserEnabled = MediaLibrary.prefs(this).getBoolean("browser_enabled", false);
+        server.addView(pocoTap(browserEnabled
+                ? "■  Выключить доступ через браузер"
+                : "🌐  Включить доступ через браузер", false, v -> {
+            boolean next = !MediaLibrary.prefs(this).getBoolean("browser_enabled", false);
+            MediaLibrary.prefs(this).edit().putBoolean("browser_enabled", next).apply();
+            if (next && !TransferService.serverRunning) {
+                MediaLibrary.prefs(this).edit().putBoolean("auto_share", true).apply();
+                TransferService.send(this, TransferService.START_SERVER);
+            }
+            render();
+        }), pocoSpace(10, 0));
+        if (browserEnabled) {
+            browserStatus = pocoText("Проверяю адрес для телевизора…", 11, false, POCO_MUTED);
+            server.addView(browserStatus, pocoSpace(8, 0));
+            server.addView(pocoTap("▣  Копировать адрес", false, v -> {
+                if (!TransferService.serverRunning || TransferService.serverIp.isEmpty()) {
+                    toast("Сначала включи раздачу и подключи Wi-Fi");
+                    return;
+                }
+                String currentAddress = "http://" + TransferService.serverIp + ":"
+                        + HttpFileServer.PORT + "/web";
+                android.content.ClipboardManager clipboard = (android.content.ClipboardManager)
+                        getSystemService(Context.CLIPBOARD_SERVICE);
+                if (clipboard != null) {
+                    clipboard.setPrimaryClip(ClipData.newPlainText("Медиатека", currentAddress));
+                    toast("Адрес скопирован");
+                }
+            }), pocoSpace(8, 0));
+            server.addView(pocoText("На телевизоре открой адрес в браузере и введи код подключения выше.",
+                    10, false, POCO_MUTED), pocoSpace(8, 0));
+        }
+        if (!browserEnabled) browserStatus = null;
         content.addView(server);
         content.addView(pocoTap("▱  Выбрать папку с сериалами",true,v -> sourceFolderPicker()),pocoSpace(9,6));
         content.addView(pocoTap("＋  Добавить отдельные видео",false,v -> sourceFilesPicker()));
